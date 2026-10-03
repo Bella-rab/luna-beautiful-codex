@@ -1,5 +1,7 @@
 # Luna Beautiful Codex
 
+English | [简体中文](README.zh-CN.md)
+
 > 连接本地 Wallpaper Engine，在 Codex 桌面端对话页内嵌壁纸选择器，一键切换页面背景。
 
 A personal Codex desktop plugin that scans **your own** local Steam Wallpaper Engine
