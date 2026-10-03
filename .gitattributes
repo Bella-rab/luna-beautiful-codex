@@ -1,0 +1,18 @@
+# Default: normalize line endings on commit, keep working copy as-is
+* text=auto
+
+# Source/docs/scripts always use LF in the repo
+*.mjs   text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+LICENSE text eol=lf
+
+# Binary media never touched
+*.mp4  binary
+*.webm binary
+*.gif  binary
+*.png  binary
+*.jpg  binary
+*.webp binary

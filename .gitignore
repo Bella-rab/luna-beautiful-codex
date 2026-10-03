@@ -1,0 +1,16 @@
+# Runtime artifacts
+server/*.log
+server/codex-wallpaper-watchdog.log
+
+# Cached wallpaper extractions and local state (per-user, never shipped)
+.cache/
+*.mp4.cache
+
+# OS / editor noise
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+.vscode/
+.idea/

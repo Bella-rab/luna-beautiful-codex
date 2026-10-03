@@ -1,0 +1,27 @@
+{
+  "name": "luna-beautiful-codex",
+  "version": "0.2.0",
+  "description": "Browse local Wallpaper Engine media and set in-page Codex backgrounds.",
+  "author": {
+    "name": "24425"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Luna Beautiful Codex",
+    "shortDescription": "连接本地 Wallpaper Engine，右下角自主切换 Codex 背景",
+    "longDescription": "Scans each user's own Steam Wallpaper Engine library, adds a bottom-right in-app picker, restores the selected background automatically, uses original high-resolution media, extracts embedded videos from supported Scene packages, and forces Codex text to white for readability. It never changes the Windows desktop wallpaper.",
+    "developerName": "24425",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "打开我的 Wallpaper Engine 壁纸选择器",
+      "把夜莞设置为 Codex 背景",
+      "重置 Codex 自定义背景"
+    ],
+    "brandColor": "#7C3AED"
+  },
+  "mcpServers": "./.mcp.json"
+}

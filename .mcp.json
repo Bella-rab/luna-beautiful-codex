@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "luna-beautiful-codex": {
+      "type": "stdio",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "server/boot.ps1"]
+    }
+  }
+}
