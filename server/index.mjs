@@ -142,6 +142,19 @@ function backgroundCss(backgroundOpacity, surfaceOpacity, blur) {
 }
 
 async function installBackground({ source, opacity = 1, surfaceOpacity = 0, blur = 0 }) {
+  try {
+    const resolved = resolveWallpaperMedia(source);
+    if (resolved.renderMode === "webgl") {
+      const port = process.env.WATCHDOG_PORT || "43310";
+      const r = await fetch("http://127.0.0.1:" + port + "/select?id=" + resolved.wallpaper.id);
+      if (r.ok) {
+        const j = await r.json();
+        return { ok: true, renderMode: "webgl", source: j.source, title: j.title, note: "Scene wallpaper delegated to watchdog for WebGL rendering; it will appear within a few seconds." };
+      }
+      if (resolved.fallbackVideo) source = resolved.fallbackVideo;
+      else if (resolved.fallbackPreview) source = resolved.fallbackPreview;
+    }
+  } catch {}
   const media = await loadMedia(source);
   const backgroundOpacity = boundedNumber(opacity, 1, 0.05, 1);
   const surfaceOpacityValue = boundedNumber(surfaceOpacity, 0, 0, 1);

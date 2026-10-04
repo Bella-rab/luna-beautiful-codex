@@ -111,13 +111,15 @@ export function listWallpapers() {
         let sceneVideo = null;
         if (scene) { try { sceneVideo = extractSceneVideo(scene); } catch {} }
 
-        if (!direct && !sceneVideo && !preview) continue;
+        if (!direct && !scene && !preview) continue;
         wallpapers.push({
           id, title: metadata.title || id,
           type: metadata.type || (direct ? "video" : scene ? "scene" : "unknown"),
           file: direct || sceneVideo || scene || preview,
           preview, scene, direct, sceneVideo,
+          sceneDir: scene ? path.dirname(scene) : null,
           fallbackPreview: (!direct && !sceneVideo && preview) ? preview : null,
+          renderMode: direct ? "native" : scene ? "webgl" : preview ? "fallback" : "unknown",
         });
       }
     } catch {}
@@ -171,18 +173,13 @@ export function resolveWallpaperMedia(source) {
     ? wallpapers.find(w => w.id === source)
     : wallpapers.find(w => source === w.id || source === w.title);
   if (item) {
-    if (item.direct) return { path: item.direct, type: MEDIA_TYPES.get(path.extname(item.direct).toLowerCase()), wallpaper: item };
-    if (item.sceneVideo) return { path: item.sceneVideo, type: "video/mp4", wallpaper: item, extracted: true };
-    if (item.fallbackPreview) return { path: item.fallbackPreview, type: MEDIA_TYPES.get(path.extname(item.fallbackPreview).toLowerCase()) || "image/gif", wallpaper: item, fallback: true };
-    if (item.scene) {
-      const extracted = extractSceneVideo(item.scene);
-      if (extracted) return { path: extracted, type: "video/mp4", wallpaper: item, extracted: true };
-      throw new Error("This Scene wallpaper has no extractable video: " + item.title);
-    }
+    if (item.direct) return { path: item.direct, type: MEDIA_TYPES.get(path.extname(item.direct).toLowerCase()), wallpaper: item, renderMode: "native" };
+    if (item.scene) return { wallpaper: item, renderMode: "webgl", scene: item.scene, sceneDir: item.sceneDir, fallbackVideo: item.sceneVideo, fallbackPreview: item.preview };
+    if (item.fallbackPreview) return { path: item.fallbackPreview, type: MEDIA_TYPES.get(path.extname(item.fallbackPreview).toLowerCase()) || "image/gif", wallpaper: item, fallback: true, renderMode: "fallback" };
   }
   const filePath = path.resolve(source);
   if (!existsSync(filePath) || !statSync(filePath).isFile()) throw new Error("Wallpaper media not found: " + source);
   const type = MEDIA_TYPES.get(path.extname(filePath).toLowerCase());
   if (!type) throw new Error("Unsupported wallpaper media: " + filePath);
-  return { path: filePath, type };
+  return { path: filePath, type, renderMode: "native" };
 }

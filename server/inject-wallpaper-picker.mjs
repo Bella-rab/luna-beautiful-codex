@@ -27,7 +27,7 @@ await new Promise((resolve, reject) => {
 const wallpapers = listWallpapers().map(item => ({
   id: item.id,
   title: item.title,
-  quality: item.direct ? "原生高清" : "Scene高清"
+  quality: item.renderMode === "native" ? "原生高清" : item.renderMode === "webgl" ? "WebGL渲染" : "静态预览"
 }));
 
 const expression = `(() => {
