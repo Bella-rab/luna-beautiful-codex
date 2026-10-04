@@ -244,79 +244,120 @@ async function removeWhiteText() {
 async function installSceneWebGL(found, current) {
   const port = lockPort;
   const wallpaperId = current.source;
-  await withPage(found.target, async command => {
+  const result = await withPage(found.target, async command => {
     return await command("Runtime.evaluate", {
       expression: `(async () => {
-        for (const id of ["codex-custom-background-media", "codex-custom-background-base", "codex-background-readability", "codex-background-controls"]) document.getElementById(id)?.remove();
-        for (const id of ["codex-custom-background-style", "codex-background-opacity-style", "codex-background-readability-style"]) document.getElementById(id)?.remove();
-        const base = document.createElement("div");
-        base.id = "codex-custom-background-base";
-        base.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important";
-        document.body.prepend(base);
-        const mediaEl = document.createElement("div");
-        mediaEl.id = "codex-custom-background-media";
-        mediaEl.setAttribute("data-wallpaper-source", ${JSON.stringify(wallpaperId)});
-        mediaEl.setAttribute("data-render-mode", "webgl");
-        mediaEl.setAttribute("data-background-opacity", "1");
-        mediaEl.setAttribute("data-surface-opacity", "0");
-        mediaEl.setAttribute("data-blur", "0");
-        mediaEl.style.cssText = "position:fixed!important;inset:0!important;z-index:0!important;pointer-events:none!important;opacity:1";
-        document.body.prepend(mediaEl);
-        const style = document.createElement("style");
-        style.id = "codex-custom-background-style";
-        style.textContent = [
-          "html, body, #root, #root *, #root *::before, #root *::after { background: transparent !important; backdrop-filter: none !important; box-shadow: none !important; }",
-          "#root { position: relative !important; z-index: 1 !important; min-height: 100vh !important; }",
-          "#codex-custom-background-base, #codex-custom-background-base canvas { display: block !important; visibility: visible !important; }"
-        ].join("\\n");
-        document.head.append(style);
         try {
-          const tc = document.createElement("canvas");
-          if (!tc.getContext("webgl2")) throw new Error("WebGL2 not available");
-          if (!window.WebWallGL) {
-            await new Promise((resolve, reject) => {
-              const s = document.createElement("script");
-              s.src = "https://cdn.jsdelivr.net/npm/webwallgl@2.0.2/webwallgl.global.min.js";
-              s.onload = () => resolve();
-              s.onerror = () => reject(new Error("webwallgl load failed"));
-              document.head.append(s);
-            });
+          if (window.__webwallglInstance) {
+            try { if (window.__webwallglInstance.destroy) window.__webwallglInstance.destroy(); } catch {}
+            try { if (window.__webwallglInstance.unmount) window.__webwallglInstance.unmount(); } catch {}
+            try { if (window.__webwallglInstance.dispose) window.__webwallglInstance.dispose(); } catch {}
+            window.__webwallglInstance = null;
           }
-          const { mount, httpSource } = window.WebWallGL;
-          await mount(base, { source: httpSource("http://127.0.0.1:${port}/scene/${wallpaperId}") });
-          mediaEl.setAttribute("data-webgl-ready", "true");
-          return { ok: true, renderMode: "webgl", source: ${JSON.stringify(wallpaperId)} };
-        } catch (err) {
-          const fbUrl = "http://127.0.0.1:${port}/scene-fallback/${wallpaperId}";
+          for (const sel of ["#codex-custom-background-base canvas", "#codex-custom-background-base"]) {
+            const el = document.querySelector(sel);
+            if (el) { try { const ctx = el.getContext ? el.getContext("webgl2") || el.getContext("webgl") : null; if (ctx && ctx.getExtension) { const ext = ctx.getExtension("WEBGL_lose_context"); if (ext) ext.loseContext(); } } catch {} el.remove(); }
+          }
+          document.getElementById("codex-custom-background-media")?.remove();
+          for (const id of ["codex-background-readability", "codex-background-controls"]) document.getElementById(id)?.remove();
+          for (const id of ["codex-custom-background-style", "codex-background-opacity-style", "codex-background-readability-style"]) document.getElementById(id)?.remove();
+
+          const base = document.createElement("div");
+          base.id = "codex-custom-background-base";
+          base.setAttribute("data-wallpaper-source", ${JSON.stringify(wallpaperId)});
+          base.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important;display:block!important";
+          document.body.prepend(base);
+          const mediaEl = document.createElement("div");
+          mediaEl.id = "codex-custom-background-media";
+          mediaEl.setAttribute("data-wallpaper-source", ${JSON.stringify(wallpaperId)});
+          mediaEl.setAttribute("data-render-mode", "webgl");
+          mediaEl.setAttribute("data-background-opacity", "1");
+          mediaEl.setAttribute("data-surface-opacity", "0");
+          mediaEl.setAttribute("data-blur", "0");
+          mediaEl.style.cssText = "position:fixed!important;inset:0!important;z-index:0!important;pointer-events:none!important;opacity:1";
+          document.body.prepend(mediaEl);
+          const style = document.createElement("style");
+          style.id = "codex-custom-background-style";
+          style.textContent = [
+            "html, body, #root, #root *, #root *::before, #root *::after { background: transparent !important; backdrop-filter: none !important; box-shadow: none !important; }",
+            "#root { position: relative !important; z-index: 1 !important; min-height: 100vh !important; }",
+            "#codex-custom-background-base, #codex-custom-background-base canvas { display: block !important; visibility: visible !important; width: 100vw !important; height: 100vh !important; }"
+          ].join("\\n");
+          document.head.append(style);
+
           try {
-            const resp = await fetch(fbUrl);
-            if (!resp.ok) throw new Error("fallback fetch failed");
-            const ct = resp.headers.get("content-type") || "";
-            const blob = await resp.blob();
-            const objUrl = URL.createObjectURL(blob);
-            const isVideo = ct.startsWith("video/");
-            mediaEl.remove();
-            const fb = document.createElement(isVideo ? "video" : "img");
-            fb.id = "codex-custom-background-media";
-            fb.src = objUrl;
-            fb.setAttribute("data-object-url", objUrl);
-            fb.setAttribute("data-wallpaper-source", ${JSON.stringify(wallpaperId)});
-            fb.setAttribute("data-render-mode", "fallback");
-            fb.setAttribute("data-background-opacity", "1");
-            fb.setAttribute("data-surface-opacity", "0");
-            fb.setAttribute("data-blur", "0");
-            if (isVideo) { fb.autoplay = true; fb.loop = true; fb.muted = true; fb.playsInline = true; fb.disablePictureInPicture = true; }
-            fb.style.cssText = "position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;object-fit:cover!important;z-index:0!important;pointer-events:none!important;background:#000;opacity:1";
-            document.body.prepend(fb);
-            if (isVideo) fb.play().catch(() => {});
-          } catch (e2) {}
-          return { ok: true, renderMode: "fallback", error: String(err), source: ${JSON.stringify(wallpaperId)} };
+            const tc = document.createElement("canvas");
+            const testCtx = tc.getContext("webgl2");
+            if (!testCtx) throw new Error("WebGL2 not available");
+            testCtx.getExtension("WEBGL_lose_context")?.loseContext();
+            if (!window.WebWallGL) {
+              let scriptLoaded = false;
+              for (let attempt = 0; attempt < 3 && !scriptLoaded; attempt++) {
+                try {
+                  const code = await fetch("https://cdn.jsdelivr.net/npm/webwallgl@2.0.2/webwallgl.global.min.js", {cache: "force-cache"}).then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.text(); });
+                  const blob = new Blob([code], {type: "application/javascript"});
+                  const blobUrl = URL.createObjectURL(blob);
+                  await new Promise((resolve, reject) => {
+                    const s = document.createElement("script");
+                    s.onload = () => { scriptLoaded = true; resolve(); };
+                    s.onerror = () => reject(new Error("blob script load failed"));
+                    s.src = blobUrl;
+                    document.head.append(s);
+                  });
+                } catch (e) { if (attempt === 2) throw e; await new Promise(r => setTimeout(r, 1000)); }
+              }
+            }
+            const { mount, httpSource } = window.WebWallGL;
+            const inst = await mount(base, { source: httpSource("http://127.0.0.1:${port}/scene/${wallpaperId}") });
+            if (inst) window.__webwallglInstance = inst;
+            mediaEl.setAttribute("data-webgl-ready", "true");
+            return { ok: true, renderMode: "webgl", source: ${JSON.stringify(wallpaperId)} };
+          } catch (err) {
+            const fbUrl = "http://127.0.0.1:${port}/scene-fallback/${wallpaperId}";
+            try {
+              const resp = await fetch(fbUrl);
+              if (!resp.ok) throw new Error("fallback HTTP " + resp.status);
+              const ct = resp.headers.get("content-type") || "";
+              const blob = await resp.blob();
+              if (blob.size < 1024) throw new Error("fallback too small: " + blob.size);
+              const objUrl = URL.createObjectURL(blob);
+              const isVideo = ct.startsWith("video/");
+              mediaEl.remove();
+              base.remove();
+              const fb = document.createElement(isVideo ? "video" : "img");
+              fb.id = "codex-custom-background-media";
+              fb.src = objUrl;
+              fb.setAttribute("data-object-url", objUrl);
+              fb.setAttribute("data-wallpaper-source", ${JSON.stringify(wallpaperId)});
+              fb.setAttribute("data-render-mode", "fallback");
+              fb.setAttribute("data-background-opacity", "1");
+              fb.setAttribute("data-surface-opacity", "0");
+              fb.setAttribute("data-blur", "0");
+              if (isVideo) { fb.autoplay = true; fb.loop = true; fb.muted = true; fb.playsInline = true; fb.disablePictureInPicture = true; }
+              fb.style.cssText = "position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;object-fit:cover!important;z-index:0!important;pointer-events:none!important;background:#000;opacity:1";
+              document.body.prepend(fb);
+              const fbBase = document.createElement("div");
+              fbBase.id = "codex-custom-background-base";
+              fbBase.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important";
+              document.body.prepend(fbBase);
+              if (isVideo) fb.play().catch(() => {});
+              return { ok: true, renderMode: "fallback", webglError: String(err), source: ${JSON.stringify(wallpaperId)} };
+            } catch (e2) {
+              return { ok: false, renderMode: "failed", webglError: String(err), fallbackError: String(e2), source: ${JSON.stringify(wallpaperId)} };
+            }
+          }
+        } catch (outerErr) {
+          return { ok: false, renderMode: "error", error: String(outerErr), source: ${JSON.stringify(wallpaperId)} };
         }
       })()`,
       returnByValue: true,
       awaitPromise: true
     });
   });
+  if (result && result.renderMode !== "webgl") {
+    log(`scene webgl ${wallpaperId}: renderMode=${result.renderMode}${result.webglError ? " webglError=" + result.webglError : ""}${result.fallbackError ? " fallbackError=" + result.fallbackError : ""}${result.error ? " error=" + result.error : ""}`);
+  }
+  return result;
 }
 async function installBackground(current) {
   const found = await findPage();

@@ -101,13 +101,11 @@ const expression = `(() => {
       status.textContent = "当前没有背景";
       return;
     }
-    const base = document.getElementById("codex-custom-background-base") ?? document.createElement("div");
-    base.id = "codex-custom-background-base";
-    base.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important";
-    media.before(base);
+    let base = document.getElementById("codex-custom-background-base");
+    if (!base) { base = document.createElement("div"); base.id = "codex-custom-background-base"; base.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important"; media.before(base); }
     const opacityStyle = document.getElementById("codex-background-opacity-style") ?? document.createElement("style");
     opacityStyle.id = "codex-background-opacity-style";
-    opacityStyle.textContent = "#codex-custom-background-media{opacity:" + percent / 100 + " !important}";
+    opacityStyle.textContent = "#codex-custom-background-media,#codex-custom-background-base,#codex-custom-background-base canvas{opacity:" + percent / 100 + " !important}";
     document.head.append(opacityStyle);
     media.setAttribute("data-background-opacity", String(percent / 100));
     if (media.tagName === "VIDEO") media.play().catch(() => {});
