@@ -244,33 +244,163 @@ async function removeWhiteText() {
 async function installSceneWebGL(found, current) {
   const port = lockPort;
   const wallpaperId = current.source;
+  const wallpaper = listWallpapers().find(item => item.id === wallpaperId);
+
+  /* Resolve the best fallback media entirely on the Node side. Codex's page
+     CSP blocks page-side fetch() to both the WebWallGL CDN and this watchdog
+     server, so the previous design (which let the page fetch its fallback over
+     HTTP) produced a pure-black background. We now inject the bytes through
+     DevTools, which bypasses CSP and mirrors the working video/image path. */
+  let fallbackPath = null;
+  let fallbackMime = "image/gif";
+  if (wallpaper && wallpaper.sceneVideo && fs.existsSync(wallpaper.sceneVideo)) {
+    fallbackPath = wallpaper.sceneVideo; fallbackMime = "video/mp4";
+  } else if (wallpaper && wallpaper.preview && fs.existsSync(wallpaper.preview)) {
+    fallbackPath = wallpaper.preview;
+    const ext = path.extname(wallpaper.preview).toLowerCase();
+    fallbackMime = { ".gif": "image/gif", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp" }[ext] || "image/gif";
+  }
+  const fallbackChunks = [];
+  if (fallbackPath) {
+    try {
+      const base64 = fs.readFileSync(fallbackPath).toString("base64");
+      for (let offset = 0; offset < base64.length; offset += chunkSize) fallbackChunks.push(base64.slice(offset, offset + chunkSize));
+    } catch (error) { log(`scene fallback read failed for ${wallpaperId}: ${error.message}`); }
+  }
+
+  /* Optional live WebGL rendering via a vendored WebWallGL build. Drop
+     webwallgl.global.min.js into <plugin>/server/vendor/ to enable it. The
+     library is injected through Runtime.evaluate, which bypasses CSP. */
+  const vendorLib = path.join(root, "vendor", "webwallgl.global.min.js");
+  let librarySource = null;
+  try { if (fs.existsSync(vendorLib)) librarySource = fs.readFileSync(vendorLib, "utf8"); } catch {}
+
+  /* The scene pkg bytes must also be injected: WebWallGL's httpSource would
+     fetch() from this server, and the page CSP (default-src 'none') blocks
+     connect-src even for inspector-injected code. bytesSource(pkgBytes,
+     project, key) feeds the library directly, so the scene renders with zero
+     page-side network. */
+  const sceneChunkSize = 4 * 1024 * 1024;
+  let sceneChunks = [];
+  let sceneProject = null;
+  if (librarySource && wallpaper && wallpaper.scene && fs.existsSync(wallpaper.scene)) {
+    try {
+      const base64 = fs.readFileSync(wallpaper.scene).toString("base64");
+      for (let offset = 0; offset < base64.length; offset += sceneChunkSize) sceneChunks.push(base64.slice(offset, offset + sceneChunkSize));
+      const projectPath = path.join(path.dirname(wallpaper.scene), "project.json");
+      if (fs.existsSync(projectPath)) { try { sceneProject = JSON.parse(fs.readFileSync(projectPath, "utf8")); } catch {} }
+    } catch (error) { log(`scene pkg read failed for ${wallpaperId}: ${error.message}`); sceneChunks = []; }
+  }
+
   const result = await withPage(found.target, async command => {
+    await command("Runtime.evaluate", { expression: "window.__codexSceneFallback = { chunks: [], mime: '' }; 0", returnByValue: true });
+    for (const chunk of fallbackChunks) {
+      await command("Runtime.evaluate", { expression: `window.__codexSceneFallback.chunks.push(${JSON.stringify(chunk)}); 0`, returnByValue: true });
+    }
+    await command("Runtime.evaluate", { expression: `window.__codexSceneFallback.mime = ${JSON.stringify(fallbackMime)}; 0`, returnByValue: true });
+
+    let libraryAvailable = false;
+    if (librarySource) {
+      libraryAvailable = await command("Runtime.evaluate", {
+        expression: `(() => { try { (0,eval)(${JSON.stringify(librarySource)}); window.__webwallglLibError = ""; return !!window.WebWallGL; } catch (e) { window.__webwallglLibError = String(e); return false; } })()`,
+        returnByValue: true,
+        awaitPromise: true
+      });
+    }
+
+    if (libraryAvailable && sceneChunks.length) {
+      await command("Runtime.evaluate", { expression: "window.__codexScenePkg = { chunks: [], project: null }; 0", returnByValue: true });
+      for (const chunk of sceneChunks) {
+        await command("Runtime.evaluate", { expression: `window.__codexScenePkg.chunks.push(${JSON.stringify(chunk)}); 0`, returnByValue: true });
+      }
+      await command("Runtime.evaluate", { expression: `window.__codexScenePkg.project = ${JSON.stringify(sceneProject)}; 0`, returnByValue: true });
+    }
+
     return await command("Runtime.evaluate", {
       expression: `(async () => {
+        const wallpaperId = ${JSON.stringify(wallpaperId)};
+        const libraryAvailable = ${JSON.stringify(!!libraryAvailable)};
+        const loseGl = (el) => { try { const ctx = el && el.getContext ? (el.getContext("webgl2") || el.getContext("webgl")) : null; if (ctx && ctx.getExtension) { const ext = ctx.getExtension("WEBGL_lose_context"); if (ext) ext.loseContext(); } } catch {} };
+        const teardown = () => {
+          if (window.__webwallglInstance) { try { if (window.__webwallglInstance.destroy) window.__webwallglInstance.destroy(); } catch {} try { if (window.__webwallglInstance.unmount) window.__webwallglInstance.unmount(); } catch {} try { if (window.__webwallglInstance.dispose) window.__webwallglInstance.dispose(); } catch {} window.__webwallglInstance = null; }
+          for (const sel of ["#codex-custom-background-base canvas", "#codex-custom-background-media", "#codex-custom-background-base"]) { const el = document.querySelector(sel); if (el) { loseGl(el); el.remove(); } }
+          for (const id of ["codex-background-readability", "codex-background-controls", "codex-custom-background-style", "codex-background-opacity-style", "codex-background-readability-style"]) { try { document.getElementById(id)?.remove(); } catch {} }
+        };
+        const injectBaseStyle = () => {
+          const style = document.createElement("style");
+          style.id = "codex-custom-background-style";
+          style.textContent = [
+            "html, body, #root, #root *, #root *::before, #root *::after { background: transparent !important; backdrop-filter: none !important; box-shadow: none !important; }",
+            "#root { position: relative !important; z-index: 1 !important; min-height: 100vh !important; }",
+            "#codex-custom-background-media { display: block !important; visibility: visible !important; }"
+          ].join("\\n");
+          document.head.append(style);
+        };
+        const renderFallback = (reason) => {
+          const data = window.__codexSceneFallback;
+          if (!data || !Array.isArray(data.chunks) || !data.chunks.length) return { ok: false, renderMode: "failed", webglError: String(reason), fallbackError: "no fallback media injected", source: wallpaperId };
+          const binary = atob(data.chunks.join(""));
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+          const objectUrl = URL.createObjectURL(new Blob([bytes], { type: data.mime }));
+          const isVideo = data.mime.startsWith("video/");
+          const usedMime = data.mime;
+          const usedBytes = bytes.length;
+          window.__codexSceneFallback = null;
+          teardown();
+          const fb = document.createElement(isVideo ? "video" : "img");
+          fb.id = "codex-custom-background-media";
+          fb.src = objectUrl;
+          fb.setAttribute("data-object-url", objectUrl);
+          fb.setAttribute("data-wallpaper-source", wallpaperId);
+          fb.setAttribute("data-render-mode", "fallback");
+          fb.setAttribute("data-background-opacity", "1");
+          fb.setAttribute("data-surface-opacity", "0");
+          fb.setAttribute("data-blur", "0");
+          if (isVideo) { fb.autoplay = true; fb.loop = true; fb.muted = true; fb.playsInline = true; fb.disablePictureInPicture = true; }
+          fb.style.cssText = "position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;object-fit:cover!important;z-index:0!important;pointer-events:none!important;background:#000;opacity:1";
+          document.body.prepend(fb);
+          const fbBase = document.createElement("div");
+          fbBase.id = "codex-custom-background-base";
+          fbBase.setAttribute("data-wallpaper-source", wallpaperId);
+          fbBase.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important";
+          document.body.prepend(fbBase);
+          injectBaseStyle();
+          if (isVideo) fb.play().catch(() => {});
+          return { ok: true, renderMode: "fallback", webglError: String(reason), source: wallpaperId, fallbackBytes: usedBytes, fallbackMime: usedMime };
+        };
         try {
-          if (window.__webwallglInstance) {
-            try { if (window.__webwallglInstance.destroy) window.__webwallglInstance.destroy(); } catch {}
-            try { if (window.__webwallglInstance.unmount) window.__webwallglInstance.unmount(); } catch {}
-            try { if (window.__webwallglInstance.dispose) window.__webwallglInstance.dispose(); } catch {}
-            window.__webwallglInstance = null;
+          teardown();
+          if (!libraryAvailable) {
+            return renderFallback(window.__webwallglLibError ? ("WebWallGL library error: " + window.__webwallglLibError) : "WebWallGL library not vendored (offline environment)");
           }
-          for (const sel of ["#codex-custom-background-base canvas", "#codex-custom-background-base"]) {
-            const el = document.querySelector(sel);
-            if (el) { try { const ctx = el.getContext ? el.getContext("webgl2") || el.getContext("webgl") : null; if (ctx && ctx.getExtension) { const ext = ctx.getExtension("WEBGL_lose_context"); if (ext) ext.loseContext(); } } catch {} el.remove(); }
-          }
-          document.getElementById("codex-custom-background-media")?.remove();
-          for (const id of ["codex-background-readability", "codex-background-controls"]) document.getElementById(id)?.remove();
-          for (const id of ["codex-custom-background-style", "codex-background-opacity-style", "codex-background-readability-style"]) document.getElementById(id)?.remove();
-
+          const tc = document.createElement("canvas");
+          const testCtx = tc.getContext("webgl2");
+          if (!testCtx) return renderFallback("WebGL2 not available");
+          try { testCtx.getExtension("WEBGL_lose_context")?.loseContext(); } catch {}
           const base = document.createElement("div");
           base.id = "codex-custom-background-base";
-          base.setAttribute("data-wallpaper-source", ${JSON.stringify(wallpaperId)});
+          base.setAttribute("data-wallpaper-source", wallpaperId);
           base.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important;display:block!important";
           document.body.prepend(base);
+          const pkgData = window.__codexScenePkg;
+          if (!pkgData || !pkgData.chunks.length) throw new Error("scene pkg not injected (missing scene.pkg?)");
+          const pkgBinary = atob(pkgData.chunks.join(""));
+          const pkgBytes = new Uint8Array(pkgBinary.length);
+          for (let i = 0; i < pkgBinary.length; i++) pkgBytes[i] = pkgBinary.charCodeAt(i);
+          const pkgLen = pkgBytes.length;
+          const pkgProject = pkgData.project;
+          window.__codexScenePkg = null;
+          const { mount, bytesSource } = window.WebWallGL;
+          const mountStarted = performance.now();
+          const inst = await mount(base, { source: bytesSource(pkgBytes, pkgProject, "watchdog:" + wallpaperId) });
+          if (!inst) throw new Error("WebWallGL mount returned no instance");
+          window.__webwallglInstance = inst;
           const mediaEl = document.createElement("div");
           mediaEl.id = "codex-custom-background-media";
-          mediaEl.setAttribute("data-wallpaper-source", ${JSON.stringify(wallpaperId)});
+          mediaEl.setAttribute("data-wallpaper-source", wallpaperId);
           mediaEl.setAttribute("data-render-mode", "webgl");
+          mediaEl.setAttribute("data-webgl-ready", "true");
           mediaEl.setAttribute("data-background-opacity", "1");
           mediaEl.setAttribute("data-surface-opacity", "0");
           mediaEl.setAttribute("data-blur", "0");
@@ -284,78 +414,19 @@ async function installSceneWebGL(found, current) {
             "#codex-custom-background-base, #codex-custom-background-base canvas { display: block !important; visibility: visible !important; width: 100vw !important; height: 100vh !important; }"
           ].join("\\n");
           document.head.append(style);
-
-          try {
-            const tc = document.createElement("canvas");
-            const testCtx = tc.getContext("webgl2");
-            if (!testCtx) throw new Error("WebGL2 not available");
-            testCtx.getExtension("WEBGL_lose_context")?.loseContext();
-            if (!window.WebWallGL) {
-              let scriptLoaded = false;
-              for (let attempt = 0; attempt < 3 && !scriptLoaded; attempt++) {
-                try {
-                  const code = await fetch("https://cdn.jsdelivr.net/npm/webwallgl@2.0.2/webwallgl.global.min.js", {cache: "force-cache"}).then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.text(); });
-                  const blob = new Blob([code], {type: "application/javascript"});
-                  const blobUrl = URL.createObjectURL(blob);
-                  await new Promise((resolve, reject) => {
-                    const s = document.createElement("script");
-                    s.onload = () => { scriptLoaded = true; resolve(); };
-                    s.onerror = () => reject(new Error("blob script load failed"));
-                    s.src = blobUrl;
-                    document.head.append(s);
-                  });
-                } catch (e) { if (attempt === 2) throw e; await new Promise(r => setTimeout(r, 1000)); }
-              }
-            }
-            const { mount, httpSource } = window.WebWallGL;
-            const inst = await mount(base, { source: httpSource("http://127.0.0.1:${port}/scene/${wallpaperId}") });
-            if (inst) window.__webwallglInstance = inst;
-            mediaEl.setAttribute("data-webgl-ready", "true");
-            return { ok: true, renderMode: "webgl", source: ${JSON.stringify(wallpaperId)} };
-          } catch (err) {
-            const fbUrl = "http://127.0.0.1:${port}/scene-fallback/${wallpaperId}";
-            try {
-              const resp = await fetch(fbUrl);
-              if (!resp.ok) throw new Error("fallback HTTP " + resp.status);
-              const ct = resp.headers.get("content-type") || "";
-              const blob = await resp.blob();
-              if (blob.size < 1024) throw new Error("fallback too small: " + blob.size);
-              const objUrl = URL.createObjectURL(blob);
-              const isVideo = ct.startsWith("video/");
-              mediaEl.remove();
-              base.remove();
-              const fb = document.createElement(isVideo ? "video" : "img");
-              fb.id = "codex-custom-background-media";
-              fb.src = objUrl;
-              fb.setAttribute("data-object-url", objUrl);
-              fb.setAttribute("data-wallpaper-source", ${JSON.stringify(wallpaperId)});
-              fb.setAttribute("data-render-mode", "fallback");
-              fb.setAttribute("data-background-opacity", "1");
-              fb.setAttribute("data-surface-opacity", "0");
-              fb.setAttribute("data-blur", "0");
-              if (isVideo) { fb.autoplay = true; fb.loop = true; fb.muted = true; fb.playsInline = true; fb.disablePictureInPicture = true; }
-              fb.style.cssText = "position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;object-fit:cover!important;z-index:0!important;pointer-events:none!important;background:#000;opacity:1";
-              document.body.prepend(fb);
-              const fbBase = document.createElement("div");
-              fbBase.id = "codex-custom-background-base";
-              fbBase.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important";
-              document.body.prepend(fbBase);
-              if (isVideo) fb.play().catch(() => {});
-              return { ok: true, renderMode: "fallback", webglError: String(err), source: ${JSON.stringify(wallpaperId)} };
-            } catch (e2) {
-              return { ok: false, renderMode: "failed", webglError: String(err), fallbackError: String(e2), source: ${JSON.stringify(wallpaperId)} };
-            }
-          }
-        } catch (outerErr) {
-          return { ok: false, renderMode: "error", error: String(outerErr), source: ${JSON.stringify(wallpaperId)} };
+          return { ok: true, renderMode: "webgl", source: wallpaperId, pkgBytes: pkgLen, mountMs: Math.round(performance.now() - mountStarted) };
+        } catch (err) {
+          return renderFallback(err);
         }
       })()`,
       returnByValue: true,
       awaitPromise: true
     });
   });
-  if (result && result.renderMode !== "webgl") {
-    log(`scene webgl ${wallpaperId}: renderMode=${result.renderMode}${result.webglError ? " webglError=" + result.webglError : ""}${result.fallbackError ? " fallbackError=" + result.fallbackError : ""}${result.error ? " error=" + result.error : ""}`);
+  if (result && result.renderMode === "webgl") {
+    log(`scene webgl ${wallpaperId}: renderMode=webgl (vendored WebWallGL, bytesSource pkgBytes=${result.pkgBytes} mountMs=${result.mountMs})`);
+  } else if (result) {
+    log(`scene webgl ${wallpaperId}: renderMode=${result.renderMode}${result.webglError ? " webglError=" + String(result.webglError).slice(0, 180) : ""}${result.fallbackError ? " fallbackError=" + result.fallbackError : ""}${result.fallbackBytes ? " fallbackBytes=" + result.fallbackBytes + " mime=" + result.fallbackMime : ""}${result.error ? " error=" + result.error : ""}`);
   }
   return result;
 }
