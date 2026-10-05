@@ -181,7 +181,16 @@ async function withPage(target, callback) {
   async function command(method, params = {}) {
     const id = nextId++;
     socket.send(JSON.stringify({ id, method, params }));
-    return await new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+    return await new Promise((resolve, reject) => {
+      /* A hidden/occluded app window can stall a DevTools evaluate forever
+         (rAF-driven library code never settles); without this the watchdog
+         main loop would stick on `restoring` and stop restoring entirely. */
+      const timer = setTimeout(() => { pending.delete(id); reject(new Error(`${method} timed out after 240s`)); }, 240000);
+      pending.set(id, {
+        resolve: value => { clearTimeout(timer); resolve(value); },
+        reject: error => { clearTimeout(timer); reject(error); },
+      });
+    });
   }
   try { return await callback(command); } finally { socket.close(); }
 }
@@ -369,7 +378,7 @@ async function installSceneWebGL(found, current) {
           if (isVideo) fb.play().catch(() => {});
           return { ok: true, renderMode: "fallback", webglError: String(reason), source: wallpaperId, fallbackBytes: usedBytes, fallbackMime: usedMime };
         };
-        try {
+        const mountWebGL = async () => {
           teardown();
           if (!libraryAvailable) {
             return renderFallback(window.__webwallglLibError ? ("WebWallGL library error: " + window.__webwallglLibError) : "WebWallGL library not vendored (offline environment)");
@@ -415,6 +424,26 @@ async function installSceneWebGL(found, current) {
           ].join("\\n");
           document.head.append(style);
           return { ok: true, renderMode: "webgl", source: wallpaperId, pkgBytes: pkgLen, mountMs: Math.round(performance.now() - mountStarted) };
+        };
+        /* While the app window is hidden/occluded Chromium freezes rAF, so the
+           render loop cannot produce the first frame mount() waits for (the
+           library gives up after 60s or hangs outright). Show the injected
+           fallback right away and upgrade to WebGL the moment the page
+           becomes visible again. */
+        if (document.visibilityState === "hidden" && window.__codexSceneFallback && window.__codexSceneFallback.chunks.length) {
+          const deferred = renderFallback("window hidden - WebGL mount deferred until the page is visible");
+          if (deferred && deferred.ok) {
+            document.addEventListener("visibilitychange", () => {
+              if (document.visibilityState !== "visible") return;
+              mountWebGL().then(result => { window.__codexDeferredWebGL = result && result.renderMode === "webgl" ? "webgl" : "failed"; }).catch(() => { window.__codexDeferredWebGL = "failed"; });
+            }, { once: true });
+            setTimeout(() => { window.__codexScenePkg = null; }, 600000);
+            return { ...deferred, deferredWebGL: true };
+          }
+          return deferred;
+        }
+        try {
+          return await mountWebGL();
         } catch (err) {
           return renderFallback(err);
         }
@@ -426,7 +455,7 @@ async function installSceneWebGL(found, current) {
   if (result && result.renderMode === "webgl") {
     log(`scene webgl ${wallpaperId}: renderMode=webgl (vendored WebWallGL, bytesSource pkgBytes=${result.pkgBytes} mountMs=${result.mountMs})`);
   } else if (result) {
-    log(`scene webgl ${wallpaperId}: renderMode=${result.renderMode}${result.webglError ? " webglError=" + String(result.webglError).slice(0, 180) : ""}${result.fallbackError ? " fallbackError=" + result.fallbackError : ""}${result.fallbackBytes ? " fallbackBytes=" + result.fallbackBytes + " mime=" + result.fallbackMime : ""}${result.error ? " error=" + result.error : ""}`);
+    log(`scene webgl ${wallpaperId}: renderMode=${result.renderMode}${result.deferredWebGL ? " deferredWebGL=true" : ""}${result.webglError ? " webglError=" + String(result.webglError).slice(0, 180) : ""}${result.fallbackError ? " fallbackError=" + result.fallbackError : ""}${result.fallbackBytes ? " fallbackBytes=" + result.fallbackBytes + " mime=" + result.fallbackMime : ""}${result.error ? " error=" + result.error : ""}`);
   }
   return result;
 }
@@ -444,6 +473,9 @@ async function installBackground(current) {
     }
     return await command("Runtime.evaluate", {
       expression: `(() => {
+        const loseGl = (el) => { try { const ctx = el && el.getContext ? (el.getContext("webgl2") || el.getContext("webgl")) : null; if (ctx && ctx.getExtension) { const ext = ctx.getExtension("WEBGL_lose_context"); if (ext) ext.loseContext(); } } catch {} };
+        if (window.__webwallglInstance) { try { window.__webwallglInstance.destroy && window.__webwallglInstance.destroy(); } catch {} try { window.__webwallglInstance.unmount && window.__webwallglInstance.unmount(); } catch {} try { window.__webwallglInstance.dispose && window.__webwallglInstance.dispose(); } catch {} window.__webwallglInstance = null; }
+        for (const sel of ["#codex-custom-background-base canvas"]) { const el = document.querySelector(sel); if (el) { loseGl(el); el.remove(); } }
         for (const id of ["codex-custom-background-media", "codex-custom-background-base", "codex-background-readability", "codex-background-controls"]) document.getElementById(id)?.remove();
         for (const id of ["codex-custom-background-style", "codex-background-opacity-style", "codex-background-readability-style"]) document.getElementById(id)?.remove();
         const binary = atob(window.__codexWallpaperChunks.join(""));
@@ -454,12 +486,14 @@ async function installBackground(current) {
         const base = document.createElement("div");
         base.id = "codex-custom-background-base";
         base.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important";
+        base.setAttribute("data-wallpaper-source", ${JSON.stringify(current.source)});
         const media = document.createElement(${JSON.stringify(isVideo ? "video" : "img")});
         media.id = "codex-custom-background-media";
         if (${JSON.stringify(isVideo)}) { media.autoplay = true; media.loop = true; media.muted = true; media.playsInline = true; media.disablePictureInPicture = true; }
         media.src = objectUrl;
         media.setAttribute("data-object-url", objectUrl);
         media.setAttribute("data-wallpaper-source", ${JSON.stringify(current.source)});
+        media.setAttribute("data-render-mode", ${JSON.stringify(media.renderMode)});
         media.setAttribute("data-background-opacity", "1");
         media.setAttribute("data-surface-opacity", "0");
         media.setAttribute("data-blur", "0");

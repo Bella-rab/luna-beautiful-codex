@@ -42,6 +42,7 @@ The watchdog works around this without touching the CSP, entirely over the DevTo
 2. It injects them into the page as base64 chunks via `Runtime.evaluate` (inspector evaluation is not subject to the page CSP).
 3. In-page, it rebuilds the bytes and constructs the source with `WebWallGL.bytesSource(pkgBytes, project, key)` — the library parses the package locally, so rendering needs **zero page-side network requests**.
 4. If the library or WebGL2 is unavailable, the same injection path installs the scene's embedded video or static preview as a fallback (never a black screen).
+5. While the Codex window is hidden or fully occluded, Chromium freezes `requestAnimationFrame`, so a WebGL scene cannot produce the first frame `mount()` waits for. In that case the watchdog installs the fallback media immediately and defers the WebGL mount via an in-page `visibilitychange` listener — the live scene appears the moment the window becomes visible. Every DevTools command also carries a 240s timeout so a stalled page can never wedge the watchdog's restore loop.
 
 ## The vendor directory
 
@@ -77,7 +78,7 @@ It switches to every wallpaper in the library, asserts each `webgl`-flagged one 
 
 ## Changelog
 
-- **0.2.1** — Scene wallpapers render for real again: WebWallGL is vendored and the scene package is injected as bytes (`bytesSource`), bypassing the page CSP that made every page-side fetch fail (the cause of the pure-black background). Fallback media is also injected instead of fetched. Added `server/selftest.mjs`.
+- **0.2.1** — Scene wallpapers render for real again: WebWallGL is vendored and the scene package is injected as bytes (`bytesSource`), bypassing the page CSP that made every page-side fetch fail (the cause of the pure-black background). Fallback media is also injected instead of fetched. The WebGL instance is torn down when switching to a native wallpaper (no more leaked GL contexts), background elements carry complete `data-wallpaper-source`/`data-render-mode` attributes, and a hidden/occluded window defers the WebGL mount instead of timing out to a static fallback. Added `server/selftest.mjs` (DevTools-based page assertions).
 - **0.2.0** — Initial public release.
 
 ## Notes
