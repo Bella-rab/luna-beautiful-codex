@@ -1,5 +1,7 @@
 # Luna Beautiful Codex
 
+English | [简体中文](README.zh-CN.md)
+
 ## What it does
 
 - Connects to the current user's local Steam Wallpaper Engine workshop library.
