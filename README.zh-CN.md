@@ -59,7 +59,7 @@ Scene 壁纸（粒子、着色器动画、脚本特效），在每次打开 Code
 1. 将本目录复制到你的 Codex 个人插件缓存：
 
    ```
-   C:\Users\<you>\.codex\plugins\cache\personal\luna-beautiful-codex\0.2.1
+   C:\Users\<you>\.codex\plugins\cache\personal\luna-beautiful-codex\0.2.2
    ```
 
 2. 重启 Codex Desktop 并启用 **Luna Beautiful Codex** 插件。
@@ -80,11 +80,26 @@ git clone https://github.com/<you>/luna-beautiful-codex.git
 cd luna-beautiful-codex
 # 用 junction 把你的 Codex 插件缓存指向克隆目录：
 New-Item -ItemType Junction `
-  -Path "$HOME\.codex\plugins\cache\personal\luna-beautiful-codex\0.2.1" `
+  -Path "$HOME\.codex\plugins\cache\personal\luna-beautiful-codex\0.2.2" `
   -Target "$(Get-Location)"
 ```
 
 然后重启 Codex 并启用插件。
+
+## 🎯 使用方法
+
+1. 在对话里说（这是插件的默认提示词）：
+
+   > 打开我的 Wallpaper Engine 壁纸选择器
+
+2. Codex 对话页右下角会出现 **壁纸** 按钮。点开列表，再点任意一行即可把该壁纸
+   应用到当前会话；顶部搜索框可按标题或创意工坊 ID 过滤。
+3. 其余操作同样可以用对话完成（见上方「MCP 工具」）：`list_backgrounds` 列出
+   壁纸、`set_background` 直接指定（ID / 标题 / 本地路径 / URL）、
+   `set_background_opacity` 调不透明度与模糊、`reset_background` 还原、
+   `background_status` 查看当前状态。
+4. 选择器与上次的壁纸会在下次打开 Codex 时自动恢复；你的选择保存在
+   `%APPDATA%\Codex\luna-beautiful-codex\wallpaper-selection.json`。
 
 ## 🗂️ 项目结构
 
@@ -194,6 +209,15 @@ node server/selftest.mjs
 
 ## 📄 更新日志
 
+- **0.2.2** — 修复「点击壁纸没反应」：`GET /status` 会抛
+  `state is not defined`，错误处理里再次 `writeHead` 触发
+  `ERR_HTTP_HEADERS_SENT`，直接把守护进程整个打挂——凡是读过 `/status`
+  的一方（包括自带的 `server/selftest.mjs`）都会让点击失效。现在该接口返回
+  真实状态，错误处理也不会再拖垮进程。选择器面板改为显式写入 `display`
+  （不再只切换 class），遗留的内联 `display` 不会再让列表永久隐藏；列表也不再
+  每 1.2 秒重建（此前会吞掉正在进行的点击、并把滚动位置弹回顶部）。选择器改用
+  与守护进程一致的 DevTools 端口探测范围（9229–9239）而不是写死 9229；MCP
+  服务端在守护进程已在运行时直接复用，不再每 5 秒重复拉起。
 - **0.2.1** — Scene 壁纸恢复真正的实时渲染：内置 WebWallGL，场景包以字节
   （`bytesSource`）注入，绕过令一切页面侧 fetch 失败的页面 CSP（纯黑背景的
   根因）。回退媒体同样改为注入而非拉取。切换到原生壁纸时销毁 WebGL 实例

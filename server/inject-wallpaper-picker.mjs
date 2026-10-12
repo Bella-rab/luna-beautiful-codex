@@ -1,7 +1,24 @@
 import { listWallpapers } from "./wallpaper-library.mjs";
 
-const target = (await (await fetch("http://127.0.0.1:9229/json/list")).json())
-  .find(item => item.type === "page" && item.url === "app://-/index.html");
+/* The Codex page is not always exposed on the same DevTools port, so probe the
+   same range the watchdog uses instead of assuming 9229. */
+const devtoolsPorts = (process.env.LUNA_DEVTOOLS_PORTS || "9229,9230,9231,9232,9233,9234,9235,9236,9237,9238,9239")
+  .split(",").map(value => parseInt(value, 10)).filter(value => value > 0);
+
+async function findPage() {
+  for (const port of devtoolsPorts) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/json/list`, { cache: "no-store" });
+      if (!response.ok) continue;
+      const targets = await response.json();
+      const target = targets.find(item => item.type === "page" && item.url === "app://-/index.html");
+      if (target) return target;
+    } catch {}
+  }
+  return null;
+}
+
+const target = await findPage();
 if (!target) throw new Error("Codex main page target not found");
 
 const socket = new WebSocket(target.webSocketDebuggerUrl);
@@ -35,7 +52,7 @@ const expression = `(() => {
   const host = document.createElement("div");
   host.id = "codex-wallpaper-picker";
   host.dataset.command = "";
-  host.style.cssText = "position:fixed;bottom:18px;right:18px;z-index:2147483646;pointer-events:auto";
+  host.style.cssText = "position:fixed!important;bottom:18px!important;right:18px!important;z-index:2147483646!important;pointer-events:auto!important;display:block!important;visibility:visible!important;opacity:1!important";
   const shadow = host.attachShadow({ mode: "open" });
   shadow.innerHTML = \`
     <style>
@@ -70,26 +87,49 @@ const expression = `(() => {
   const search = shadow.querySelector("input");
   const list = shadow.querySelector(".list");
   const status = shadow.querySelector(".status");
+  let pointerDown = false;
+  let lastSignature = null;
   function currentSource(){return document.getElementById("codex-custom-background-media")?.getAttribute("data-wallpaper-source")||""}
-  function render(){
-    const needle=search.value.trim().toLowerCase();
-    const items=wallpapers.filter(item=>item.title.toLowerCase().includes(needle)||item.id.includes(needle));
-    list.innerHTML="";
-    for(const item of items){
-      const button=document.createElement("button");
-      button.className="item"+(item.id===currentSource()?" active":"");
-      button.innerHTML='<span class="id">'+item.id+'</span><span class="name">'+item.title.replace(/</g,"&lt;")+'</span><span class="quality">'+item.quality+'</span>';
-      button.onclick=()=>{hostRoot.dataset.command=item.id;status.textContent="正在切换："+item.title};
+  function render(force){
+    /* Rebuilding the list while the user is pressing a row replaces the node
+       under their pointer, so the click is swallowed. */
+    if (pointerDown && !force) return;
+    const needle = search.value.trim().toLowerCase();
+    const items = wallpapers.filter(item => item.title.toLowerCase().includes(needle) || item.id.includes(needle));
+    const next = needle + "|" + currentSource() + "|" + items.map(item => item.id).join(",");
+    if (!force && next === lastSignature) return;
+    lastSignature = next;
+    const scrollTop = list.scrollTop;
+    const active = currentSource();
+    list.innerHTML = "";
+    for (const item of items) {
+      const button = document.createElement("button");
+      button.className = "item" + (item.id === active ? " active" : "");
+      button.innerHTML = '<span class="id">' + item.id + '</span><span class="name">' + item.title.replace(/</g, "&lt;") + '</span><span class="quality">' + item.quality + '</span>';
+      button.onclick = () => { hostRoot.dataset.command = item.id; status.textContent = "正在切换：" + item.title; };
       list.append(button);
     }
+    list.scrollTop = scrollTop;
   }
-  launcher.onclick=()=>{panel.classList.toggle("open");if(panel.classList.contains("open"))render()};
-  shadow.querySelector(".close").onclick=()=>panel.classList.remove("open");
-  search.oninput=render;
-  setInterval(()=>{if(panel.classList.contains("open"))render()},1200);
+  function setOpen(open){
+    panel.classList.toggle("open", open);
+    /* Set display explicitly instead of trusting the .panel.open class alone:
+       a leftover inline display on the panel outranks the stylesheet and made
+       the 壁纸 button look dead. */
+    panel.style.setProperty("display", open ? "block" : "none", "important");
+    if (open) render(true);
+  }
+  launcher.onclick = () => setOpen(!panel.classList.contains("open"));
+  shadow.querySelector(".close").onclick = () => setOpen(false);
+  search.oninput = () => render(true);
+  window.addEventListener("pointerdown", () => { pointerDown = true; }, true);
+  window.addEventListener("pointerup", () => { pointerDown = false; }, true);
+  window.addEventListener("pointercancel", () => { pointerDown = false; }, true);
+  setInterval(() => { if (panel.classList.contains("open")) render(false); }, 1200);
   document.body.append(host);
-  render();
-  return {ok:true,count:wallpapers.length};
+  setOpen(false);
+  render(true);
+  return { ok: true, count: wallpapers.length };
 })()`;
 
 const result = await send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });

@@ -14,6 +14,61 @@ English | [简体中文](README.zh-CN.md)
 - Restores the selected background automatically while Codex is open.
 - Does not change the Windows desktop wallpaper and does not make the Codex window transparent.
 
+## Install
+
+Luna Beautiful Codex is a **Codex desktop plugin** (a skill plus a small local MCP server) — not a standalone app. Codex starts the server, and the server draws the picker inside the Codex conversation page.
+
+Personal install (per user):
+
+1. Clone the plugin into your personal plugin directory:
+
+   ```
+   git clone https://github.com/Bella-rab/luna-beautiful-codex.git "$HOME/plugins/luna-beautiful-codex"
+   ```
+
+2. Register it in your personal marketplace, `~/.agents/plugins/marketplace.json` (keep any existing entries and append this one):
+
+   ```json
+   {
+     "name": "personal",
+     "interface": { "displayName": "Personal" },
+     "plugins": [
+       {
+         "name": "luna-beautiful-codex",
+         "source": { "source": "local", "path": "./plugins/luna-beautiful-codex" },
+         "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+         "category": "Productivity"
+       }
+     ]
+   }
+   ```
+
+3. Restart Codex Desktop, open the plugin list and enable **Luna Beautiful Codex**. Make sure Wallpaper Engine has at least one downloaded workshop wallpaper.
+
+Alternatively you can simply ask Codex to install this repository as a personal plugin.
+
+## Usage
+
+1. Ask Codex to start the picker — these are the plugin's default prompts:
+
+   > 打开我的 Wallpaper Engine 壁纸选择器
+
+2. A **壁纸** button appears in the bottom-right corner of the Codex conversation page. Click it, then click a row in the list to apply that wallpaper to the current session. The search box filters by title or workshop ID.
+
+3. Everything can also be driven from chat:
+
+   | Tool | What it does |
+   |------|--------------|
+   | `list_backgrounds` | List local Wallpaper Engine media (optional `search`). |
+   | `set_background` | Apply a wallpaper by workshop ID, title, local path or URL (plus `opacity`, `surfaceOpacity`, `blur`). |
+   | `set_background_opacity` | Tune opacity / panel opacity / blur of the installed background. |
+   | `reset_background` | Remove the custom background and restore Codex's original styling. |
+   | `enable_white_text` / `disable_white_text` | Toggle the forced white conversation text. |
+   | `background_status` | Check what is installed and whether it is playing. |
+   | `enable_wallpaper_picker` | Start the local watcher and show the bottom-right picker. |
+
+4. The local watcher restores your last selection the next time Codex starts; the choice is stored in `%APPDATA%\Codex\luna-beautiful-codex\wallpaper-selection.json`.
+
 ## Wallpaper types
 
 | Type | Render mode | Description |
@@ -80,6 +135,7 @@ It switches to every wallpaper in the library, asserts each `webgl`-flagged one 
 
 ## Changelog
 
+- **0.2.2** — Fixes the picker going dead. `GET /status` threw `state is not defined`, and the error handler then re-sent headers (`ERR_HTTP_HEADERS_SENT`), which killed the watchdog process itself — so anything that read `/status`, including the bundled `server/selftest.mjs`, silently stopped clicks from applying wallpapers. The endpoint now reports the real state and the handler can no longer take the process down. The picker panel is opened and closed by writing an explicit `display` rule instead of only toggling a class, so a leftover inline `display` can no longer keep the list hidden, and the list no longer rebuilds every 1.2 s (which used to swallow in-flight clicks and reset the scroll position mid-pick). The picker probes DevTools ports 9229–9239 like the watchdog instead of assuming 9229, and the MCP server now attaches to an already running watchdog instead of respawning one every 5 s.
 - **0.2.1** — Scene wallpapers render for real again: WebWallGL is vendored and the scene package is injected as bytes (`bytesSource`), bypassing the page CSP that made every page-side fetch fail (the cause of the pure-black background). Fallback media is also injected instead of fetched. The WebGL instance is torn down when switching to a native wallpaper (no more leaked GL contexts), background elements carry complete `data-wallpaper-source`/`data-render-mode` attributes, and a hidden/occluded window defers the WebGL mount instead of timing out to a static fallback. Added `server/selftest.mjs` (DevTools-based page assertions).
 - **0.2.0** — Initial public release.
 

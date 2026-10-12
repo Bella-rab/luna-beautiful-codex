@@ -394,9 +394,25 @@ const TOOLS = [
 ];
 
 let wallpaperWatchdog = null;
-function startWallpaperWatchdog() {
+let wallpaperWatchdogBusy = false;
+async function watchdogIsRunning() {
+  try {
+    const response = await fetch("http://127.0.0.1:" + (process.env.WATCHDOG_PORT || "43310") + "/health", { signal: AbortSignal.timeout(1500) });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+async function startWallpaperWatchdog() {
   if (wallpaperWatchdog && wallpaperWatchdog.exitCode === null) {
     return { ok: true, running: true, pid: wallpaperWatchdog.pid };
+  }
+  /* Another Codex MCP server (or a watchdog left over from an earlier session)
+     may already own the lock port. Spawning a second watchdog only makes it
+     exit with EADDRINUSE - and retrying that every few seconds flooded the
+     watchdog log forever. Attach to the running watchdog instead. */
+  if (await watchdogIsRunning()) {
+    return { ok: true, running: true, attached: true };
   }
   wallpaperWatchdog = spawn(process.execPath, [WATCHDOG_SCRIPT], {
     windowsHide: true,
@@ -425,7 +441,7 @@ async function callTool(name, args = {}) {
     case "enable_white_text": return toggleWhiteText(true);
     case "disable_white_text": return toggleWhiteText(false);
     case "background_status": return backgroundStatus();
-    case "enable_wallpaper_picker": return startWallpaperWatchdog();
+    case "enable_wallpaper_picker": return await startWallpaperWatchdog();
     default: return { ok: false, error: "Unknown tool: " + name };
   }
 }
@@ -462,8 +478,12 @@ readlineInterface.on("line", async line => {
   }
 });
 
-startWallpaperWatchdog();
+startWallpaperWatchdog().catch(() => {});
 setInterval(() => {
-  if (!wallpaperWatchdog) startWallpaperWatchdog();
-}, 5000);
+  if (wallpaperWatchdog || wallpaperWatchdogBusy) return;
+  wallpaperWatchdogBusy = true;
+  startWallpaperWatchdog()
+    .catch(() => {})
+    .finally(() => { wallpaperWatchdogBusy = false; });
+}, 30000);
 
