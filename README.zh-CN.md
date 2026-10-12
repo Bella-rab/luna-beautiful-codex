@@ -59,7 +59,7 @@ Scene 壁纸（粒子、着色器动画、脚本特效），在每次打开 Code
 1. 将本目录复制到你的 Codex 个人插件缓存：
 
    ```
-   C:\Users\<you>\.codex\plugins\cache\personal\luna-beautiful-codex\0.2.2
+   C:\Users\<you>\.codex\plugins\cache\personal\luna-beautiful-codex\0.2.3
    ```
 
 2. 重启 Codex Desktop 并启用 **Luna Beautiful Codex** 插件。
@@ -80,7 +80,7 @@ git clone https://github.com/<you>/luna-beautiful-codex.git
 cd luna-beautiful-codex
 # 用 junction 把你的 Codex 插件缓存指向克隆目录：
 New-Item -ItemType Junction `
-  -Path "$HOME\.codex\plugins\cache\personal\luna-beautiful-codex\0.2.2" `
+  -Path "$HOME\.codex\plugins\cache\personal\luna-beautiful-codex\0.2.3" `
   -Target "$(Get-Location)"
 ```
 
@@ -209,6 +209,19 @@ node server/selftest.mjs
 
 ## 📄 更新日志
 
+- **0.2.3** — 切换更顺、更清晰。三个根因一起修：
+  （1）部分壁纸的 `project.json` 里写的是首字母大写的 `"type": "Scene"`，旧逻辑只认小写 `scene`，
+  于是这些 3D 动态壁纸被当成「静态图」，把低分辨率的 `preview.gif` 拉伸到全屏——这就是
+  「刚出来是模糊的」。现在只要目录里有 `scene.pkg` 就一律按 Scene 处理，直接用 WebGL 实时渲染。
+  （2）每次扫描壁纸都要把 `scene.pkg` 整个读进内存去找内嵌视频（最大的有 126MB），一次约
+  0.5–0.7 秒，而一次切换会扫描好几遍。现在扫描结果缓存 30 秒、内嵌视频探测按
+  （路径 + 修改时间 + 大小）记忆化，重复扫描耗时降为 0 毫秒。
+  （3）以前切换会先把旧背景拆掉再装新的，中间整屏发黑，而且最先看到的是糊的预览图。
+  现在「旧图先留着，新图在后台挂好再交叉淡出」，实测黑屏空档为 0。
+  其他：渲染精度提升到「设备像素比与 1.5 取较大值」并开启 4× MSAA（此前纹理只按
+  0.5–0.6 倍采样，这是画面发糊的第二个来源），实测帧率仍保持 59–60fps；不再为注定
+  用不上的回退视频预注入 100MB 数据；已在运行的守护进程不会再被反复拉起。普通 Scene
+  壁纸的切换耗时从约 7.6 秒降到约 2 秒。
 - **0.2.2** — 修复「点击壁纸没反应」：`GET /status` 会抛
   `state is not defined`，错误处理里再次 `writeHead` 触发
   `ERR_HTTP_HEADERS_SENT`，直接把守护进程整个打挂——凡是读过 `/status`

@@ -10,6 +10,23 @@ export const MEDIA_TYPES = new Map([
   [".webp", "image/webp"], [".avif", "image/avif"]
 ]);
 
+/* Scanning the workshop is not free: it spawns reg.exe, stats every folder and
+   - for Scene wallpapers - used to read every scene.pkg just to look for an
+   embedded video. The watchdog re-scans on every selection, so both the scan
+   result and the per-package video probe are memoized here. */
+const LIST_TTL_MS = 30000;
+let cachedWallpapers = null;
+let cachedListedAt = 0;
+let cachedLibraries = null;
+const sceneVideoMemo = new Map();
+
+export function invalidateWallpaperCache() {
+  cachedWallpapers = null;
+  cachedListedAt = 0;
+  cachedLibraries = null;
+  sceneVideoMemo.clear();
+}
+
 function reg(key, value) {
   try {
     const result = spawnSync("reg.exe", ["query", key, "/v", value], { encoding: "utf8" });
@@ -38,6 +55,7 @@ function probeDrivesForSteam() {
 }
 
 export function steamLibraries() {
+  if (cachedLibraries) return cachedLibraries;
   const libraries = new Set();
   if (process.env.STEAM_LIBRARY) libraries.add(process.env.STEAM_LIBRARY);
 
@@ -66,7 +84,8 @@ export function steamLibraries() {
     }
   }
 
-  return [...libraries];
+  cachedLibraries = [...libraries];
+  return cachedLibraries;
 }
 
 /* Try several writable locations for the extraction cache. */
@@ -84,6 +103,9 @@ function resolveCacheDir() {
 }
 
 export function listWallpapers() {
+  const now = Date.now();
+  if (cachedWallpapers && now - cachedListedAt < LIST_TTL_MS) return cachedWallpapers;
+
   const wallpapers = [];
   const seen = new Set();
   for (const library of steamLibraries()) {
@@ -103,10 +125,21 @@ export function listWallpapers() {
           if (existsSync(candidate)) { preview = candidate; break; }
         }
         const declared = metadata.file ? path.join(directory, metadata.file) : null;
-        const sceneCandidate = path.join(directory, "scene.pkg");
-        const sceneFromMetadata = declared && path.extname(declared).toLowerCase() === ".pkg" && existsSync(declared) ? declared : null;
-        const scene = (metadata.type === "scene" && existsSync(sceneCandidate)) ? sceneCandidate : sceneFromMetadata;
-        const direct = !scene && declared && MEDIA_TYPES.has(path.extname(declared).toLowerCase()) && existsSync(declared) ? declared : null;
+        const declaredExt = declared ? path.extname(declared).toLowerCase() : "";
+        /* A declared media file always wins. Otherwise the folder is a Scene
+           whenever scene.pkg exists - package name and casing of metadata.type
+           ("scene" vs "Scene") both vary between workshop uploads, and the old
+           exact "scene" match sent Scene wallpapers into the blurry static
+           preview(path). */
+        const direct = declared && MEDIA_TYPES.has(declaredExt) && existsSync(declared) ? declared : null;
+        let scene = null;
+        if (!direct) {
+          if (declared && declaredExt === ".pkg" && existsSync(declared)) scene = declared;
+          else {
+            const sceneCandidate = path.join(directory, "scene.pkg");
+            if (existsSync(sceneCandidate)) scene = sceneCandidate;
+          }
+        }
 
         let sceneVideo = null;
         if (scene) { try { sceneVideo = extractSceneVideo(scene); } catch {} }
@@ -124,7 +157,9 @@ export function listWallpapers() {
       }
     } catch {}
   }
-  return wallpapers.sort((a, b) => a.title.localeCompare(b.title, "zh-Hans-CN"));
+  cachedWallpapers = wallpapers.sort((a, b) => a.title.localeCompare(b.title, "zh-Hans-CN"));
+  cachedListedAt = Date.now();
+  return cachedWallpapers;
 }
 
 function parsePkg(buffer) {
@@ -147,6 +182,16 @@ function embeddedVideo(bytes) {
 }
 
 export function extractSceneVideo(scenePath) {
+  let stat;
+  try { stat = statSync(scenePath); } catch { return null; }
+  const memo = sceneVideoMemo.get(scenePath);
+  if (memo && memo.mtimeMs === stat.mtimeMs && memo.size === stat.size) return memo.result;
+  const result = extractSceneVideoUncached(scenePath);
+  sceneVideoMemo.set(scenePath, { mtimeMs: stat.mtimeMs, size: stat.size, result });
+  return result;
+}
+
+function extractSceneVideoUncached(scenePath) {
   const cacheDir = resolveCacheDir();
   if (!cacheDir) return null;
   const cachePath = path.join(cacheDir, path.basename(path.dirname(scenePath)) + ".mp4");

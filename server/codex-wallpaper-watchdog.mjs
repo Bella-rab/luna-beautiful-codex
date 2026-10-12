@@ -98,6 +98,7 @@ async function acquireServer() {
             writeSelection(wallpaper.id, wallpaper.title);
             mediaCache.delete(wallpaper.id);
             log(`select ${wallpaper.id} via http`);
+            wakeTicker();
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: true, source: wallpaper.id, title: wallpaper.title }));
           } else {
@@ -318,17 +319,29 @@ async function installSceneWebGL(found, current) {
      only the total byte count is read up front; the bytes themselves are
      streamed chunk-by-chunk during injection, so neither side ever holds the
      whole file plus its ~1.33x base64 expansion at once. */
+  /* Pick the cheapest fallback media. A few Scene packages embed a >100MB video
+     that the old code streamed through DevTools on every single switch (273 x
+     384KB round trips) even though WebGL renders fine; the ~1MB preview image
+     is plenty for the rare WebGL failure, so prefer the smaller candidate and
+     skip the pre-injection entirely when even that is oversized. */
+  const FALLBACK_MAX_BYTES = 24 * 1024 * 1024;
+  const fallbackCandidates = [];
+  if (wallpaper && wallpaper.sceneVideo && fs.existsSync(wallpaper.sceneVideo)) {
+    let size = 0; try { size = fs.statSync(wallpaper.sceneVideo).size; } catch {}
+    fallbackCandidates.push({ path: wallpaper.sceneVideo, mime: "video/mp4", size });
+  }
+  if (wallpaper && wallpaper.preview && fs.existsSync(wallpaper.preview)) {
+    const ext = path.extname(wallpaper.preview).toLowerCase();
+    let size = 0; try { size = fs.statSync(wallpaper.preview).size; } catch {}
+    fallbackCandidates.push({ path: wallpaper.preview, mime: { ".gif": "image/gif", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp" }[ext] || "image/gif", size });
+  }
+  fallbackCandidates.sort((a, b) => a.size - b.size);
+  const chosenFallback = fallbackCandidates.find(candidate => candidate.size > 0) || null;
   let fallbackPath = null;
   let fallbackMime = "image/gif";
   let fallbackBytes = 0;
-  if (wallpaper && wallpaper.sceneVideo && fs.existsSync(wallpaper.sceneVideo)) {
-    fallbackPath = wallpaper.sceneVideo; fallbackMime = "video/mp4";
-    try { fallbackBytes = fs.statSync(fallbackPath).size; } catch {}
-  } else if (wallpaper && wallpaper.preview && fs.existsSync(wallpaper.preview)) {
-    fallbackPath = wallpaper.preview;
-    const ext = path.extname(wallpaper.preview).toLowerCase();
-    fallbackMime = { ".gif": "image/gif", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp" }[ext] || "image/gif";
-    try { fallbackBytes = fs.statSync(fallbackPath).size; } catch {}
+  if (chosenFallback && chosenFallback.size <= FALLBACK_MAX_BYTES) {
+    fallbackPath = chosenFallback.path; fallbackMime = chosenFallback.mime; fallbackBytes = chosenFallback.size;
   }
 
   /* Optional live WebGL rendering via a vendored WebWallGL build. Drop
@@ -380,7 +393,9 @@ async function installSceneWebGL(found, current) {
     }
   }
 
+  const phaseMs = { pre: 0 };
   const result = await withPage(found.target, async command => {
+    const preStartedAt = Date.now();
     await command("Runtime.evaluate", { expression: `window.__codexSceneFallback = { bytes: new Uint8Array(${fallbackBytes}), offset: 0, mime: ${JSON.stringify(fallbackMime)} }; 0`, returnByValue: true });
     if (fallbackPath && fallbackBytes > 0) {
       let fallbackInjected = true;
@@ -394,8 +409,11 @@ async function installSceneWebGL(found, current) {
 
     let libraryAvailable = false;
     if (librarySource) {
+      /* Re-evaluating the ~1.1MB library on every switch cost a few hundred ms.
+         window.WebWallGL survives background swaps, so only inject it when the
+         page has actually lost it (fresh page, or after an app reload). */
       libraryAvailable = await command("Runtime.evaluate", {
-        expression: `(() => { try { (0,eval)(${JSON.stringify(librarySource)}); window.__webwallglLibError = ""; window.__webwallglApiKeys = window.WebWallGL ? Object.keys(window.WebWallGL).sort().join(",") : ""; return !!window.WebWallGL; } catch (e) { window.__webwallglLibError = String(e); return false; } })()`,
+        expression: `(() => { if (window.WebWallGL && typeof window.WebWallGL.mount === "function" && typeof window.WebWallGL.bytesSource === "function") return true; try { (0,eval)(${JSON.stringify(librarySource)}); window.__webwallglLibError = ""; window.__webwallglApiKeys = window.WebWallGL ? Object.keys(window.WebWallGL).sort().join(",") : ""; return !!window.WebWallGL; } catch (e) { window.__webwallglLibError = String(e); return false; } })()`,
         returnByValue: true,
         awaitPromise: true
       });
@@ -414,6 +432,7 @@ async function installSceneWebGL(found, current) {
       if (!sceneInjected) { await command("Runtime.evaluate", { expression: "window.__codexScenePkg = null; 0", returnByValue: true }); }
     }
 
+    phaseMs.pre = Date.now() - preStartedAt;
     if (selectEpoch !== installEpoch) { log(`install aborted (superseded): ${wallpaperId}`); return { ok: true, renderMode: "aborted", source: wallpaperId }; }
     return await command("Runtime.evaluate", {
       expression: `(async () => {
@@ -430,6 +449,7 @@ async function installSceneWebGL(found, current) {
         const lastDiag = () => { if (!diagBuffer.length) return ""; const last = diagBuffer[diagBuffer.length - 1]; return last.level + ":" + last.msg; };
         const diagCount = () => diagBuffer.length;
         const injectBaseStyle = () => {
+          document.getElementById("codex-custom-background-style")?.remove();
           const style = document.createElement("style");
           style.id = "codex-custom-background-style";
           style.textContent = [
@@ -439,18 +459,42 @@ async function installSceneWebGL(found, current) {
           ].join("\\n");
           document.head.append(style);
         };
-        const renderFallback = (reason) => {
+        /* Cross-fade plumbing. The currently visible layers are captured up
+           front and left alone (still rendering) while the replacement is
+           staged at opacity 0; once it is ready we swap the ids into place and
+           fade the old layers out. Previously every switch tore the old
+           background down first, so the page sat on a black canvas for the
+           whole inject+mount window - and with a slow mount the blurry preview
+           was the first thing the user saw. */
+        const PENDING_BASE_ID = "codex-custom-background-base-pending";
+        const previousLayers = () => ["codex-custom-background-base", "codex-custom-background-media"].map(id => document.getElementById(id)).filter(Boolean);
+        const dropPending = () => { const el = document.getElementById(PENDING_BASE_ID); if (el) { loseGl(el.querySelector("canvas")); el.remove(); } };
+        const revealBackground = (baseEl, mediaEl, oldLayers) => {
+          baseEl.id = "codex-custom-background-base";
+          mediaEl.id = "codex-custom-background-media";
+          document.body.prepend(mediaEl);
+          document.body.prepend(baseEl);
+          baseEl.style.opacity = "1";
+          mediaEl.style.opacity = "1";
+          for (const el of oldLayers) {
+            if (!el || !el.isConnected) continue;
+            const deadCanvas = el.querySelector ? el.querySelector("canvas") : null;
+            el.style.transition = "opacity 260ms ease";
+            el.style.opacity = "0";
+            setTimeout(() => { try { if (deadCanvas) loseGl(deadCanvas); el.remove(); } catch {} }, 340);
+          }
+        };
+        const renderFallback = (reason, oldLayers) => {
           const data = window.__codexSceneFallback;
           if (!data || !data.bytes || !data.bytes.length) return { ok: false, renderMode: "failed", webglError: String(reason), fallbackError: "no fallback media injected", source: wallpaperId };
           const bytes = data.bytes;
-          const objectUrl = URL.createObjectURL(new Blob([bytes], { type: data.mime }));
-          const isVideo = data.mime.startsWith("video/");
           const usedMime = data.mime;
+          const isVideo = usedMime.startsWith("video/");
           const usedBytes = bytes.length;
           window.__codexSceneFallback = null;
-          teardown();
+          dropPending();
+          const objectUrl = URL.createObjectURL(new Blob([bytes], { type: usedMime }));
           const fb = document.createElement(isVideo ? "video" : "img");
-          fb.id = "codex-custom-background-media";
           fb.src = objectUrl;
           fb.setAttribute("data-object-url", objectUrl);
           fb.setAttribute("data-wallpaper-source", wallpaperId);
@@ -459,30 +503,29 @@ async function installSceneWebGL(found, current) {
           fb.setAttribute("data-surface-opacity", "0");
           fb.setAttribute("data-blur", "0");
           if (isVideo) { fb.autoplay = true; fb.loop = true; fb.muted = true; fb.playsInline = true; fb.disablePictureInPicture = true; }
-          fb.style.cssText = "position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;object-fit:cover!important;z-index:0!important;pointer-events:none!important;background:#000;opacity:1";
-          document.body.prepend(fb);
+          fb.style.cssText = "position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;object-fit:cover!important;z-index:0!important;pointer-events:none!important;background:#000;opacity:0";
           const fbBase = document.createElement("div");
-          fbBase.id = "codex-custom-background-base";
           fbBase.setAttribute("data-wallpaper-source", wallpaperId);
-          fbBase.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important";
-          document.body.prepend(fbBase);
+          fbBase.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important;opacity:0";
+          revealBackground(fbBase, fb, oldLayers);
           injectBaseStyle();
           if (isVideo) fb.play().catch(() => {});
           return { ok: true, renderMode: "fallback", webglError: String(reason), source: wallpaperId, fallbackBytes: usedBytes, fallbackMime: usedMime };
         };
-        const mountWebGL = async () => {
-          teardown();
+        const mountWebGL = async (oldLayers) => {
+          dropPending();
           if (!libraryAvailable) {
-            return renderFallback(window.__webwallglLibError ? ("WebWallGL library error: " + window.__webwallglLibError) : "WebWallGL library not vendored (offline environment)");
+            return renderFallback(window.__webwallglLibError ? ("WebWallGL library error: " + window.__webwallglLibError) : "WebWallGL library not vendored (offline environment)", oldLayers);
           }
           const tc = document.createElement("canvas");
           const testCtx = tc.getContext("webgl2");
-          if (!testCtx) return renderFallback("WebGL2 not available");
+          if (!testCtx) return renderFallback("WebGL2 not available", oldLayers);
           try { testCtx.getExtension("WEBGL_lose_context")?.loseContext(); } catch {}
+          const previousInstance = window.__webwallglInstance;
           const base = document.createElement("div");
-          base.id = "codex-custom-background-base";
+          base.id = PENDING_BASE_ID;
           base.setAttribute("data-wallpaper-source", wallpaperId);
-          base.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important;display:block!important";
+          base.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important;display:block!important;opacity:0";
           document.body.prepend(base);
           const pkgData = window.__codexScenePkg;
           if (!pkgData || !pkgData.bytes || !pkgData.bytes.length) throw new Error("scene pkg not injected (missing scene.pkg?)");
@@ -491,25 +534,43 @@ async function installSceneWebGL(found, current) {
           const pkgProject = pkgData.project;
           window.__codexScenePkg = null;
           const { mount, bytesSource } = window.WebWallGL;
+          /* Ask WebWallGL for the top tier it can hold: renderDpr >= 1.5 lifts
+             its internal resource cap (textures were sampled at 0.6-0.8x) and
+             4x MSAA cleans up edges. The library's own adaptive quality still
+             steps down on a machine that cannot keep up. */
+          const renderDpr = Math.min(2, Math.max(window.devicePixelRatio || 1, 1.5));
+          const quality = { antiAliasing: "msaa4", particles: "high", postProcessing: "high" };
+          const mountOptions = extra => ({
+            source: bytesSource(pkgBytes, pkgProject, "watchdog:" + wallpaperId),
+            renderDpr,
+            quality,
+            onDiagnostic: (lvl, msg) => pushDiag(lvl, msg),
+            onError: () => pushDiag("error", "mount onError"),
+            ...extra
+          });
           const mountStarted = performance.now();
           let inst = null; let retried = false;
-          try { inst = await mount(base, { source: bytesSource(pkgBytes, pkgProject, "watchdog:" + wallpaperId), onDiagnostic: (lvl, msg) => pushDiag(lvl, msg), onError: () => pushDiag("error", "mount onError") }); }
+          try { inst = await mount(base, mountOptions({})); }
           catch (mountErr) {
             const msg = String(mountErr && mountErr.message || mountErr || "");
             const isFirstFrameTimeout = /首帧超时|first frame|firstFrame/i.test(msg);
             pushDiag("error", "mount failed: " + msg.slice(0, 160));
             if (isFirstFrameTimeout) {
               try { if (mountErr && mountErr.instance && mountErr.instance.destroy) mountErr.instance.destroy(); } catch {}
-              try { const oldBase = document.getElementById("codex-custom-background-base"); if (oldBase) { const c = oldBase.querySelector("canvas"); if (c) { const x = c.getContext("webgl2"); if (x && x.getExtension) { const e = x.getExtension("WEBGL_lose_context"); if (e) e.loseContext(); } } oldBase.remove(); } const nb = document.createElement("div"); nb.id = "codex-custom-background-base"; nb.setAttribute("data-wallpaper-source", wallpaperId); nb.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important;display:block!important"; document.body.prepend(nb); } catch {}
+              dropPending();
+              const nb = document.createElement("div");
+              nb.id = PENDING_BASE_ID;
+              nb.setAttribute("data-wallpaper-source", wallpaperId);
+              nb.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important;display:block!important;opacity:0";
+              document.body.prepend(nb);
               pushDiag("info", "retrying mount with mountTimeoutMs=0 (first-frame timeout recovery)");
-              try { inst = await mount(document.getElementById("codex-custom-background-base"), { source: bytesSource(pkgBytes, pkgProject, "watchdog:" + wallpaperId), mountTimeoutMs: 0, onDiagnostic: (lvl, msg) => pushDiag(lvl, msg), onError: () => pushDiag("error", "mount onError (retry)") }); retried = true; }
+              try { inst = await mount(nb, mountOptions({ mountTimeoutMs: 0 })); retried = true; }
               catch (retryErr) { pushDiag("error", "mount retry failed: " + String(retryErr && retryErr.message || retryErr).slice(0, 160)); throw retryErr; }
             } else { throw mountErr; }
           }
           if (!inst) throw new Error("WebWallGL mount returned no instance");
           window.__webwallglInstance = inst;
           const mediaEl = document.createElement("div");
-          mediaEl.id = "codex-custom-background-media";
           mediaEl.setAttribute("data-wallpaper-source", wallpaperId);
           mediaEl.setAttribute("data-render-mode", "webgl");
           mediaEl.setAttribute("data-webgl-ready", "true");
@@ -517,28 +578,34 @@ async function installSceneWebGL(found, current) {
           mediaEl.setAttribute("data-surface-opacity", "0");
           mediaEl.setAttribute("data-blur", "0");
           mediaEl.style.cssText = "position:fixed!important;inset:0!important;z-index:0!important;pointer-events:none!important;opacity:1";
-          document.body.prepend(mediaEl);
+          revealBackground(document.getElementById(PENDING_BASE_ID) || base, mediaEl, oldLayers);
+          if (previousInstance && previousInstance !== inst) {
+            setTimeout(() => { try { previousInstance.destroy && previousInstance.destroy(); } catch {} try { previousInstance.unmount && previousInstance.unmount(); } catch {} try { previousInstance.dispose && previousInstance.dispose(); } catch {} }, 360);
+          }
+          document.getElementById("codex-custom-background-style")?.remove();
           const style = document.createElement("style");
           style.id = "codex-custom-background-style";
           style.textContent = [
             "html, body, #root, #root *, #root *::before, #root *::after { background: transparent !important; backdrop-filter: none !important; box-shadow: none !important; }",
             "#root { position: relative !important; z-index: 1 !important; min-height: 100vh !important; }",
-            "#codex-custom-background-base, #codex-custom-background-base canvas { display: block !important; visibility: visible !important; width: 100vw !important; height: 100vh !important; }"
+            "#codex-custom-background-base, #codex-custom-background-base-pending { display: block !important; visibility: visible !important; width: 100vw !important; height: 100vh !important; }",
+            "#codex-custom-background-base canvas, #codex-custom-background-base-pending canvas { display: block !important; visibility: visible !important; width: 100vw !important; height: 100vh !important; }"
           ].join("\\n");
           document.head.append(style);
-          return { ok: true, renderMode: "webgl", source: wallpaperId, pkgBytes: pkgLen, mountMs: Math.round(performance.now() - mountStarted), mountRetried: retried, lastDiag: lastDiag(), diagCount: diagCount() };
+          return { ok: true, renderMode: "webgl", source: wallpaperId, pkgBytes: pkgLen, mountMs: Math.round(performance.now() - mountStarted), mountRetried: retried, renderDpr, lastDiag: lastDiag(), diagCount: diagCount() };
         };
         /* While the app window is hidden/occluded Chromium freezes rAF, so the
            render loop cannot produce the first frame mount() waits for (the
            library gives up after 60s or hangs outright). Show the injected
            fallback right away and upgrade to WebGL the moment the page
            becomes visible again. */
+        const oldLayers = previousLayers();
         if (document.visibilityState === "hidden" && window.__codexSceneFallback && window.__codexSceneFallback.bytes && window.__codexSceneFallback.bytes.length) {
-          const deferred = renderFallback("window hidden - WebGL mount deferred until the page is visible");
+          const deferred = renderFallback("window hidden - WebGL mount deferred until the page is visible", oldLayers);
           if (deferred && deferred.ok) {
             document.addEventListener("visibilitychange", () => {
               if (document.visibilityState !== "visible") return;
-              mountWebGL().then(result => { window.__codexDeferredWebGL = result && result.renderMode === "webgl" ? "webgl" : "failed"; if (result && result.lastDiag) window.__codexDeferredDiag = result.lastDiag; }).catch(err => { window.__codexDeferredWebGL = "failed"; window.__codexDeferredDiag = String(err?.message || err); });
+              mountWebGL(previousLayers()).then(result => { window.__codexDeferredWebGL = result && result.renderMode === "webgl" ? "webgl" : "failed"; if (result && result.lastDiag) window.__codexDeferredDiag = result.lastDiag; }).catch(err => { window.__codexDeferredWebGL = "failed"; window.__codexDeferredDiag = String(err?.message || err); });
             }, { once: true });
             setTimeout(() => { window.__codexScenePkg = null; }, 600000);
             return { ...deferred, deferredWebGL: true };
@@ -546,9 +613,9 @@ async function installSceneWebGL(found, current) {
           return deferred;
         }
         try {
-          return await mountWebGL();
+          return await mountWebGL(oldLayers);
         } catch (err) {
-          return renderFallback(err);
+          return renderFallback(err, oldLayers);
         }
       })()`,
       returnByValue: true,
@@ -556,7 +623,7 @@ async function installSceneWebGL(found, current) {
     }, 120000);
   });
   if (result && result.renderMode === "webgl") {
-    log(`scene webgl ${wallpaperId}: renderMode=webgl (vendored WebWallGL, bytesSource pkgBytes=${result.pkgBytes} mountMs=${result.mountMs}${result.mountRetried ? " retried=true" : ""}${result.lastDiag ? " lastDiag=" + String(result.lastDiag).slice(0, 160) : ""}${result.diagCount ? " diagCount=" + result.diagCount : ""})`);
+    log(`scene webgl ${wallpaperId}: renderMode=webgl (vendored WebWallGL, bytesSource pkgBytes=${result.pkgBytes} mountMs=${result.mountMs} preMs=${phaseMs.pre}${result.mountRetried ? " retried=true" : ""}${result.lastDiag ? " lastDiag=" + String(result.lastDiag).slice(0, 160) : ""}${result.diagCount ? " diagCount=" + result.diagCount : ""})`);
   } else if (result) {
     log(`scene webgl ${wallpaperId}: renderMode=${result.renderMode}${result.deferredWebGL ? " deferredWebGL=true" : ""}${result.webglError ? " webglError=" + String(result.webglError).slice(0, 180) : ""}${result.fallbackError ? " fallbackError=" + result.fallbackError : ""}${result.fallbackBytes ? " fallbackBytes=" + result.fallbackBytes + " mime=" + result.fallbackMime : ""}${result.error ? " error=" + result.error : ""}${result.lastDiag ? " lastDiag=" + String(result.lastDiag).slice(0, 160) : ""}${result.diagCount ? " diagCount=" + result.diagCount : ""}`);
   }
@@ -584,32 +651,59 @@ async function installBackground(current) {
     return await command("Runtime.evaluate", {
       expression: `(async () => {
         const loseGl = (el) => { try { const ctx = el && el.getContext ? (el.getContext("webgl2") || el.getContext("webgl")) : null; if (ctx && ctx.getExtension) { const ext = ctx.getExtension("WEBGL_lose_context"); if (ext) ext.loseContext(); } } catch {} };
-        if (window.__webwallglInstance) { try { window.__webwallglInstance.destroy && window.__webwallglInstance.destroy(); } catch {} try { window.__webwallglInstance.unmount && window.__webwallglInstance.unmount(); } catch {} try { window.__webwallglInstance.dispose && window.__webwallglInstance.dispose(); } catch {} window.__webwallglInstance = null; }
-        for (const sel of ["#codex-custom-background-base canvas"]) { const el = document.querySelector(sel); if (el) { loseGl(el); el.remove(); } }
-        for (const id of ["codex-custom-background-media", "codex-custom-background-base", "codex-background-readability", "codex-background-controls"]) document.getElementById(id)?.remove();
-        for (const id of ["codex-custom-background-style", "codex-background-opacity-style", "codex-background-readability-style"]) document.getElementById(id)?.remove();
-        await new Promise(r => setTimeout(r, 0));
+        const previousLayers = () => ["codex-custom-background-base", "codex-custom-background-media"].map(id => document.getElementById(id)).filter(Boolean);
+        const oldLayers = previousLayers();
+        const previousInstance = window.__webwallglInstance;
+        document.getElementById("codex-custom-background-base-pending")?.remove();
         const bytes = window.__codexWallpaperBytes.bytes;
         window.__codexWallpaperBytes = null;
         const objectUrl = URL.createObjectURL(new Blob([bytes], { type: ${JSON.stringify(media.type)} }));
-        await new Promise(r => setTimeout(r, 0));
         const base = document.createElement("div");
-        base.id = "codex-custom-background-base";
-        base.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important";
+        base.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important;opacity:0";
         base.setAttribute("data-wallpaper-source", ${JSON.stringify(current.source)});
-        const media = document.createElement(${JSON.stringify(isVideo ? "video" : "img")});
-        media.id = "codex-custom-background-media";
-        if (${JSON.stringify(isVideo)}) { media.autoplay = true; media.loop = true; media.muted = true; media.playsInline = true; media.disablePictureInPicture = true; }
-        media.src = objectUrl;
-        media.setAttribute("data-object-url", objectUrl);
-        media.setAttribute("data-wallpaper-source", ${JSON.stringify(current.source)});
-        media.setAttribute("data-render-mode", ${JSON.stringify(media.renderMode)});
-        media.setAttribute("data-background-opacity", "1");
-        media.setAttribute("data-surface-opacity", "0");
-        media.setAttribute("data-blur", "0");
-        media.style.cssText = "position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;object-fit:cover!important;z-index:0!important;pointer-events:none!important;background:#000;opacity:1";
-        document.body.prepend(media);
-        document.body.insertBefore(base, media);
+        const el = document.createElement(${JSON.stringify(isVideo ? "video" : "img")});
+        if (${JSON.stringify(isVideo)}) { el.autoplay = true; el.loop = true; el.muted = true; el.playsInline = true; el.disablePictureInPicture = true; el.preload = "auto"; }
+        el.src = objectUrl;
+        el.setAttribute("data-object-url", objectUrl);
+        el.setAttribute("data-wallpaper-source", ${JSON.stringify(current.source)});
+        el.setAttribute("data-render-mode", ${JSON.stringify(media.renderMode)});
+        el.setAttribute("data-background-opacity", "1");
+        el.setAttribute("data-surface-opacity", "0");
+        el.setAttribute("data-blur", "0");
+        el.style.cssText = "position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;object-fit:cover!important;z-index:0!important;pointer-events:none!important;background:#000;opacity:0";
+        /* Hold the new media behind the visible background (opacity 0) until it
+           has something to paint, then swap and cross-fade - the page never
+           goes black and never shows a half-decoded frame. */
+        el.id = "codex-custom-background-media";
+        base.id = "codex-custom-background-base";
+        document.body.prepend(el);
+        document.body.prepend(base);
+        await new Promise(resolve => {
+          let settled = false;
+          const done = () => { if (!settled) { settled = true; resolve(); } };
+          if (${JSON.stringify(isVideo)}) {
+            if (el.readyState >= 2) return done();
+            el.addEventListener("loadeddata", done, { once: true });
+            el.addEventListener("error", done, { once: true });
+            setTimeout(done, 4000);
+            return;
+          }
+          if (el.complete && el.naturalWidth) return done();
+          el.addEventListener("load", done, { once: true });
+          el.addEventListener("error", done, { once: true });
+          setTimeout(done, 4000);
+        });
+        el.style.opacity = "1";
+        base.style.opacity = "1";
+        for (const old of oldLayers) {
+          if (!old || !old.isConnected || old === el || old === base) continue;
+          const deadCanvas = old.querySelector ? old.querySelector("canvas") : null;
+          old.style.transition = "opacity 260ms ease";
+          old.style.opacity = "0";
+          setTimeout(() => { try { if (deadCanvas) loseGl(deadCanvas); old.remove(); } catch {} }, 340);
+        }
+        if (previousInstance) setTimeout(() => { try { previousInstance.destroy && previousInstance.destroy(); } catch {} try { previousInstance.unmount && previousInstance.unmount(); } catch {} try { previousInstance.dispose && previousInstance.dispose(); } catch {} }, 360);
+        document.getElementById("codex-custom-background-style")?.remove();
         const style = document.createElement("style");
         style.id = "codex-custom-background-style";
         style.textContent = [
@@ -618,8 +712,7 @@ async function installBackground(current) {
           "#codex-custom-background-media { display: block !important; visibility: visible !important; }"
         ].join("\\n");
         document.head.append(style);
-        await new Promise(r => setTimeout(r, 0));
-        if (${JSON.stringify(isVideo)}) media.play().catch(() => {});
+        if (${JSON.stringify(isVideo)}) el.play().catch(() => {});
         return { bytes: bytes.length, type: ${JSON.stringify(media.type)}, source: ${JSON.stringify(current.source)} };
       })()`,
       returnByValue: true,
@@ -630,6 +723,16 @@ async function installBackground(current) {
 
 let restoring = false;
 let selectEpoch = 0;
+/* Polling every 2s made every switch feel sluggish even after the scan cache
+   landed; 800ms keeps the loop cheap and /select now wakes it instantly. */
+let ticker = null;
+function wakeTicker() { if (ticker) ticker(); }
+function nextTick() {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => { ticker = null; resolve(); }, 800);
+    ticker = () => { clearTimeout(timer); ticker = null; resolve(); };
+  });
+}
 let controlsRunning = false;
 let pickerRunning = false;
 function launchControls() {
@@ -681,5 +784,5 @@ for (;;) {
       finally { clearTimeout(installSafety); restoring = false; }
     }
   } catch (error) { log(`error: ${error.message}`); }
-  await wait(2000);
+  await nextTick();
 }
