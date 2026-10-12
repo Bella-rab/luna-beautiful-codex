@@ -226,9 +226,10 @@ async function main() {
 
   console.log("\nselftest: picker UI");
   const picker = await verifyPicker(page, original.source, wallpapers.find(item => item.id === original.source)?.renderMode || "native");
-  rows.push(["picker", "ui", picker.detail]);
+  rows.push({ id: "picker", mode: "ui", load: "-", detail: picker.detail, seconds: 0, ok: picker.ok });
   console.log(`  ${picker.ok ? "OK" : "FAIL"}  ${picker.detail}`);
-  if (!picker.ok) failures.push(`picker: ${picker.detail}`);
+  if (picker.ok) passCount++;
+  else failures.push(`picker: ${picker.detail}`);
 
 
   page.close();
