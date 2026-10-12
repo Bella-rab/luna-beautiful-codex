@@ -1,5 +1,22 @@
-const target = (await (await fetch("http://127.0.0.1:9229/json/list")).json())
-  .find(item => item.type === "page" && item.url === "app://-/index.html");
+/* The Codex page is not always exposed on the same DevTools port, so probe the
+   same range the watchdog uses instead of assuming 9229. */
+const devtoolsPorts = (process.env.LUNA_DEVTOOLS_PORTS || "9229,9230,9231,9232,9233,9234,9235,9236,9237,9238,9239")
+  .split(",").map(value => parseInt(value, 10)).filter(value => value > 0);
+
+async function findPage() {
+  for (const port of devtoolsPorts) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/json/list`, { cache: "no-store" });
+      if (!response.ok) continue;
+      const targets = await response.json();
+      const target = targets.find(item => item.type === "page" && item.url === "app://-/index.html");
+      if (target) return target;
+    } catch {}
+  }
+  return null;
+}
+
+const target = await findPage();
 if (!target) throw new Error("Codex main page target not found");
 
 const socket = new WebSocket(target.webSocketDebuggerUrl);

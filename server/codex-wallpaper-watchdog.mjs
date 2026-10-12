@@ -381,6 +381,9 @@ async function installSceneWebGL(found, current) {
     } else if (stat && sceneBytes <= PKG_CACHE_MAX) {
       try {
         const bytes = fs.readFileSync(scenePath);
+        /* Drop a stale entry's bytes first so the budget does not over-count. */
+        const staleEntry = pkgByteCache.get(wallpaperId);
+        if (staleEntry) pkgCacheBytes -= staleEntry.bytes.length;
         pkgByteCache.delete(wallpaperId);
         pkgByteCache.set(wallpaperId, { bytes, mtime: stat.mtimeMs, size: sceneBytes });
         pkgCacheBytes += bytes.length;
