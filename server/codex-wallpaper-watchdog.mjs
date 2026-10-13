@@ -15,6 +15,14 @@ const logPath = path.join(root, "codex-wallpaper-watchdog.log");
 const lockPort = 43310;
 const devtoolsPorts = [9229, 9230, 9231, 9232, 9233, 9234, 9235, 9236, 9237, 9238, 9239];
 const chunkSize = 512 * 1024;
+
+/* A single hidden file input lives in the page so the renderer can read
+   wallpaper files straight off disk. DevTools hands the input real file paths,
+   Chromium exposes them to the page as file-backed Blobs, and WebWallGL takes
+   that File directly - which removes the base64-over-DevTools transport that
+   made large packages slow (126MB used to need ~273 chunked round trips) while
+   leaving CSP untouched: the page still does no fetching of its own. */
+const FILE_INPUT_ID = "__luna_file";
 const VENDORED_WEBWALLGL_VERSION = "2.1.0";
 let libCapabilitiesLogged = false;
 const mediaCache = new Map();
@@ -79,15 +87,11 @@ function writePrefs(patch) {
   return next;
 }
 
-function loadMedia(source) {
-  if (!mediaCache.has(source)) {
-    const media = resolveWallpaperMedia(source);
-    if (media.renderMode === "webgl") mediaCache.set(source, media);
-    else {
-      const buf = fs.readFileSync(media.path);
-      mediaCache.set(source, buf.length <= NATIVE_CACHE_MAX ? { ...media, buf } : media);
-    }
-  }
+/* Wallpaper metadata only. The bytes are no longer read up front: the page reads
+   them from the File the DOM command channel handed it, and the byte-injection
+   fallback reads the file off disk only when it is actually needed. */
+function mediaMeta(source) {
+  if (!mediaCache.has(source)) mediaCache.set(source, resolveWallpaperMedia(source));
   return mediaCache.get(source);
 }
 
@@ -207,7 +211,10 @@ async function withPage(target, callback) {
     pending.delete(message.id);
     if (message.error) waiter.reject(new Error(message.error.message));
     else if (message.result?.exceptionDetails) waiter.reject(new Error(message.result.exceptionDetails.exception?.description || message.result.exceptionDetails.text));
-    else waiter.resolve(message.result?.result?.value);
+    /* Runtime.evaluate answers with {result:{value}}; DOM domain commands answer
+       with a plain object (e.g. {nodeId}). Return whichever is present so the CDP
+       file channel can be driven through this same helper. */
+    else waiter.resolve(message.result && message.result.result ? message.result.result.value : message.result);
   };
   socket.onclose = () => { for (const waiter of pending.values()) { try { waiter.reject(new Error("DevTools socket closed")); } catch {} } pending.clear(); };
   async function command(method, params = {}, timeoutMs = 30000) {
@@ -323,7 +330,6 @@ function* base64ChunkSourceFromBuffer(buf, rawChunkBytes) {
 const pkgByteCache = new Map();
 const PKG_CACHE_MAX = 256 * 1024 * 1024;
 const PKG_CACHE_BUDGET = 512 * 1024 * 1024;
-const NATIVE_CACHE_MAX = 256 * 1024 * 1024;
 let pkgCacheBytes = 0;
 
 function evictPkgCache() {
@@ -333,6 +339,72 @@ function evictPkgCache() {
     pkgByteCache.delete(oldest);
     pkgCacheBytes -= entry.bytes.length;
   }
+}
+
+/* Drive the hidden file input over the DOM domain. It returns { ok: true } only
+   after the page confirms it can see every requested file, so callers can fall
+   back to byte injection on any failure. DOM.requestNode answers 0 for this
+   page, hence getDocument + querySelector; the node is re-resolved on every call
+   because node ids go stale whenever the page reloads. */
+const FILE_INPUT_INIT = `(() => {
+  let input = document.getElementById(${JSON.stringify(FILE_INPUT_ID)});
+  if (!input || !input.isConnected) {
+    input = document.createElement("input");
+    input.type = "file";
+    input.id = ${JSON.stringify(FILE_INPUT_ID)};
+    input.multiple = true;
+    input.tabIndex = -1;
+    input.setAttribute("aria-hidden", "true");
+    input.style.cssText = "position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;z-index:-1";
+    (document.documentElement || document.body).append(input);
+  }
+  return input.isConnected;
+})()`;
+
+async function primeFileInput(command, paths) {
+  const wanted = [...new Set((paths || []).filter(Boolean))];
+  if (!wanted.length) return { ok: false, error: "no files to hand over" };
+  try { await command("Runtime.evaluate", { expression: FILE_INPUT_INIT, returnByValue: true }); }
+  catch (error) { return { ok: false, error: "file input init failed: " + error.message }; }
+  try { await command("DOM.enable", {}); }
+  catch (error) { return { ok: false, error: "DOM.enable failed: " + error.message }; }
+  let rootId = 0;
+  try { const doc = await command("DOM.getDocument", { depth: 2 }); rootId = doc && doc.root ? doc.root.nodeId : 0; }
+  catch (error) { return { ok: false, error: "DOM.getDocument failed: " + error.message }; }
+  if (!rootId) return { ok: false, error: "DOM.getDocument returned no root node" };
+  let nodeId = 0;
+  try { const node = await command("DOM.querySelector", { nodeId: rootId, selector: "#" + FILE_INPUT_ID }); nodeId = node && node.nodeId ? node.nodeId : 0; }
+  catch (error) { return { ok: false, error: "DOM.querySelector failed: " + error.message }; }
+  if (!nodeId) return { ok: false, error: "file input missing from the page" };
+  try { await command("DOM.setFileInputFiles", { files: wanted, nodeId }); }
+  catch (error) { return { ok: false, error: "DOM.setFileInputFiles failed: " + error.message }; }
+  let seen = null;
+  try { seen = await command("Runtime.evaluate", { expression: `(() => { const input = document.getElementById(${JSON.stringify(FILE_INPUT_ID)}); return input && input.files ? Array.from(input.files).map(file => file.name + ":" + file.size) : null; })()`, returnByValue: true }); }
+  catch (error) { return { ok: false, error: "file input verify failed: " + error.message }; }
+  if (!Array.isArray(seen) || seen.length !== wanted.length) return { ok: false, error: "file input holds " + (Array.isArray(seen) ? seen.length : "no") + " of " + wanted.length + " file(s)" };
+  return { ok: true, files: seen };
+}
+
+/* Hand the hidden input the absolute paths this switch needs and report them
+   back in input order. Chromium turns each path into a file-backed Blob, so the
+   page can give WebWallGL - or a <video>/<img> - the File itself and read the
+   media straight off disk. No wallpaper bytes cross DevTools this way; ok=false
+   means the caller should fall back to the byte stream. */
+async function primeWallpaperFiles(command, paths) {
+  const wanted = [];
+  const seen = new Set();
+  for (const candidate of paths || []) {
+    if (!candidate || seen.has(candidate)) continue;
+    let exists = false;
+    try { exists = fs.existsSync(candidate); } catch {}
+    if (!exists) continue;
+    seen.add(candidate);
+    wanted.push(candidate);
+  }
+  if (!wanted.length) return { ok: false, error: "no wallpaper files on disk" };
+  const primed = await primeFileInput(command, wanted);
+  if (!primed.ok) return primed;
+  return { ok: true, paths: wanted, names: wanted.map(item => path.basename(item)), files: primed.files };
 }
 /* In-page chunk sink shared by the scene pkg, the scene fallback and the native
    media injection. Uint8Array.fromBase64 decodes a whole chunk in one native
@@ -417,11 +489,13 @@ async function installSceneWebGL(found, current) {
       if (fs.existsSync(projectPath)) { try { sceneProject = JSON.parse(fs.readFileSync(projectPath, "utf8")); } catch {} }
     } catch (error) { log(`scene pkg stat failed for ${wallpaperId}: ${error.message}`); scenePath = null; sceneBytes = 0; }
   }
-  /* Resolve scene bytes: try the in-memory pkg cache first (Phase 3), so
-     A->B->A re-selects skip disk I/O entirely. On cache miss + file small
-     enough, read the full file once and cache it for future hot paths. */
+  /* The scene bytes only need to sit in Node's memory for the byte-stream
+     fallback. With the CDP file channel the page reads the file itself, so the
+     read (up to 126MB for the heaviest package) is deferred until that fallback
+     is actually used. */
   let sceneBuf = null;
-  if (scenePath && sceneBytes > 0) {
+  const loadSceneBuf = () => {
+    if (sceneBuf || !scenePath || sceneBytes <= 0) return sceneBuf;
     let stat;
     try { stat = fs.statSync(scenePath); } catch { stat = null; }
     const cached = stat ? pkgByteCache.get(wallpaperId) : null;
@@ -444,20 +518,50 @@ async function installSceneWebGL(found, current) {
     } else if (stat && sceneBytes > PKG_CACHE_MAX) {
       log(`pkg cache bypass ${wallpaperId} (file ${sceneBytes} bytes exceeds ${PKG_CACHE_MAX} limit, streaming from disk)`);
     }
-  }
+    return sceneBuf;
+  };
 
   const phaseMs = { pre: 0 };
   const result = await withPage(found.target, async command => {
     const preStartedAt = Date.now();
-    await command("Runtime.evaluate", { expression: `${INGEST_HELPER}\nwindow.__codexSceneFallback = { bytes: new Uint8Array(${fallbackBytes}), offset: 0, mime: ${JSON.stringify(fallbackMime)} }; 0`, returnByValue: true });
-    if (fallbackPath && fallbackBytes > 0) {
+
+    /* Hand the page the files themselves over the DOM domain: only paths cross
+       the wire, and Chromium exposes each as a file-backed Blob the page reads
+       at disk speed. The scene pkg (and its fallback media) therefore no longer
+       travel as base64 chunks through DevTools - the source of the switch lag. */
+    const wantedPaths = [];
+    if (scenePath && sceneBytes > 0) wantedPaths.push(scenePath);
+    if (fallbackPath && fallbackBytes > 0) wantedPaths.push(fallbackPath);
+    const primed = wantedPaths.length ? await primeWallpaperFiles(command, wantedPaths) : { ok: false, error: "no scene files on disk" };
+    const sceneIndex = primed.ok ? primed.paths.indexOf(scenePath) : -1;
+    const fallbackIndex = primed.ok ? primed.paths.indexOf(fallbackPath) : -1;
+    if (!primed.ok) log(`scene ${wallpaperId}: file channel unavailable (${primed.error}), streaming bytes`);
+
+    await command("Runtime.evaluate", { expression: `${INGEST_HELPER}\nwindow.__codexScenePkg = null; window.__codexSceneFallback = null; window.__codexSceneFiles = ${JSON.stringify({ sceneIndex, project: sceneProject, fallbackIndex, fallbackMime })}; 0`, returnByValue: true });
+
+    /* Tier three: stream the pkg bytes through DevTools only when the file did
+       not make it into the page. */
+    if (sceneIndex < 0 && scenePath && sceneBytes > 0) {
+      await command("Runtime.evaluate", { expression: `window.__codexScenePkg = { bytes: new Uint8Array(${sceneBytes}), offset: 0, project: ${JSON.stringify(sceneProject)} }; 0`, returnByValue: true });
+      let sceneInjected = true;
+      const buffered = loadSceneBuf();
+      const sceneSource = buffered ? base64ChunkSourceFromBuffer(buffered, sceneRawChunk) : base64ChunkSource(scenePath, sceneRawChunk);
+      for (const chunk of sceneSource) {
+        if (selectEpoch !== installEpoch) { log(`install aborted (superseded during scene injection): ${wallpaperId}`); sceneInjected = false; break; }
+        try { await command("Runtime.evaluate", { expression: `window.__codexIngest("__codexScenePkg", ${JSON.stringify(chunk)})`, returnByValue: true, awaitPromise: true }); }
+        catch (error) { log(`scene pkg inject failed for ${wallpaperId}: ${error.message}`); sceneInjected = false; break; }
+      }
+      if (!sceneInjected) { await command("Runtime.evaluate", { expression: "window.__codexScenePkg = null; 0", returnByValue: true }); }
+    }
+    if (fallbackIndex < 0 && fallbackPath && fallbackBytes > 0) {
+      await command("Runtime.evaluate", { expression: `window.__codexSceneFallback = { bytes: new Uint8Array(${fallbackBytes}), offset: 0, mime: ${JSON.stringify(fallbackMime)} }; 0`, returnByValue: true });
       let fallbackInjected = true;
       for (const chunk of base64ChunkSource(fallbackPath, fallbackRawChunk)) {
         if (selectEpoch !== installEpoch) { log(`install aborted (superseded during fallback injection): ${wallpaperId}`); fallbackInjected = false; break; }
         try { await command("Runtime.evaluate", { expression: `window.__codexIngest("__codexSceneFallback", ${JSON.stringify(chunk)})`, returnByValue: true, awaitPromise: true }); }
         catch (error) { log(`scene fallback inject failed for ${wallpaperId}: ${error.message}`); fallbackInjected = false; break; }
       }
-      if (!fallbackInjected) { await command("Runtime.evaluate", { expression: "window.__codexSceneFallback = { bytes: new Uint8Array(0), offset: 0, mime: '' }; 0", returnByValue: true }); }
+      if (!fallbackInjected) { await command("Runtime.evaluate", { expression: "window.__codexSceneFallback = null; 0", returnByValue: true }); }
     }
 
     let libraryAvailable = false;
@@ -473,17 +577,6 @@ async function installSceneWebGL(found, current) {
     }
     if (libraryAvailable && !libCapabilitiesLogged) { try { const apiKeys = await command("Runtime.evaluate", { expression: "window.__webwallglApiKeys || ''", returnByValue: true }); const missing = ["mount", "bytesSource"].filter(k => !apiKeys.includes(k)); log(`webwallgl vendored=${VENDORED_WEBWALLGL_VERSION} api=[${apiKeys}]${missing.length ? " MISSING=" + missing.join(",") : ""}`); libCapabilitiesLogged = true; } catch {} }
 
-    if (libraryAvailable && scenePath && sceneBytes > 0) {
-      await command("Runtime.evaluate", { expression: `${INGEST_HELPER}\nwindow.__codexScenePkg = { bytes: new Uint8Array(${sceneBytes}), offset: 0, project: ${JSON.stringify(sceneProject)} }; 0`, returnByValue: true });
-      let sceneInjected = true;
-      const sceneSource = sceneBuf ? base64ChunkSourceFromBuffer(sceneBuf, sceneRawChunk) : base64ChunkSource(scenePath, sceneRawChunk);
-      for (const chunk of sceneSource) {
-        if (selectEpoch !== installEpoch) { log(`install aborted (superseded during scene injection): ${wallpaperId}`); sceneInjected = false; break; }
-        try { await command("Runtime.evaluate", { expression: `window.__codexIngest("__codexScenePkg", ${JSON.stringify(chunk)})`, returnByValue: true, awaitPromise: true }); }
-        catch (error) { log(`scene pkg inject failed for ${wallpaperId}: ${error.message}`); sceneInjected = false; break; }
-      }
-      if (!sceneInjected) { await command("Runtime.evaluate", { expression: "window.__codexScenePkg = null; 0", returnByValue: true }); }
-    }
 
     phaseMs.pre = Date.now() - preStartedAt;
     if (selectEpoch !== installEpoch) { log(`install aborted (superseded): ${wallpaperId}`); return { ok: true, renderMode: "aborted", source: wallpaperId }; }
@@ -539,14 +632,26 @@ async function installSceneWebGL(found, current) {
         };
         const renderFallback = (reason, oldLayers) => {
           const data = window.__codexSceneFallback;
-          if (!data || !data.bytes || !data.bytes.length) return { ok: false, renderMode: "failed", webglError: String(reason), fallbackError: "no fallback media injected", source: wallpaperId };
-          const bytes = data.bytes;
-          const usedMime = data.mime;
+          const sceneInfo = window.__codexSceneFiles;
+          const fallbackInput = document.getElementById(${JSON.stringify(FILE_INPUT_ID)});
+          const fallbackFile = fallbackInput && sceneInfo && sceneInfo.fallbackIndex >= 0 && fallbackInput.files ? fallbackInput.files[sceneInfo.fallbackIndex] : null;
+          let objectUrl = null;
+          let usedMime = "";
+          let usedBytes = 0;
+          if (fallbackFile) {
+            objectUrl = URL.createObjectURL(fallbackFile);
+            usedMime = (sceneInfo && sceneInfo.fallbackMime) || fallbackFile.type || "image/gif";
+            usedBytes = fallbackFile.size;
+          } else if (data && data.bytes && data.bytes.length) {
+            usedBytes = data.bytes.length;
+            usedMime = data.mime;
+            objectUrl = URL.createObjectURL(new Blob([data.bytes], { type: usedMime }));
+          } else {
+            return { ok: false, renderMode: "failed", webglError: String(reason), fallbackError: "no fallback media injected", source: wallpaperId };
+          }
           const isVideo = usedMime.startsWith("video/");
-          const usedBytes = bytes.length;
           window.__codexSceneFallback = null;
           dropPending();
-          const objectUrl = URL.createObjectURL(new Blob([bytes], { type: usedMime }));
           const fb = document.createElement(isVideo ? "video" : "img");
           fb.src = objectUrl;
           fb.setAttribute("data-object-url", objectUrl);
@@ -563,7 +668,7 @@ async function installSceneWebGL(found, current) {
           revealBackground(fbBase, fb, oldLayers);
           injectBaseStyle();
           if (isVideo) fb.play().catch(() => {});
-          return { ok: true, renderMode: "fallback", webglError: String(reason), source: wallpaperId, fallbackBytes: usedBytes, fallbackMime: usedMime };
+          return { ok: true, renderMode: "fallback", webglError: String(reason), source: wallpaperId, fallbackBytes: usedBytes, fallbackMime: usedMime, via: fallbackFile ? "file" : "cdp" };
         };
         /* One page-wide guard for WEBGL context loss. Installed once and
            intentionally listening on document (capture) so it survives the
@@ -620,13 +725,33 @@ async function installSceneWebGL(found, current) {
           base.setAttribute("data-wallpaper-source", wallpaperId);
           base.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important;display:block!important;opacity:0";
           document.body.prepend(base);
+          const sceneInfo = window.__codexSceneFiles || null;
           const pkgData = window.__codexScenePkg;
-          if (!pkgData || !pkgData.bytes || !pkgData.bytes.length) throw new Error("scene pkg not injected (missing scene.pkg?)");
-          const pkgBytes = pkgData.bytes;
-          const pkgLen = pkgBytes.length;
-          const pkgProject = pkgData.project;
+          const pkgProject = (sceneInfo && sceneInfo.project) || (pkgData && pkgData.project) || null;
+          const fileInput = document.getElementById(${JSON.stringify(FILE_INPUT_ID)});
+          const sceneFile = fileInput && sceneInfo && sceneInfo.sceneIndex >= 0 && fileInput.files ? fileInput.files[sceneInfo.sceneIndex] : null;
+          const { mount, bytesSource, fileSource } = window.WebWallGL;
+          /* Three tiers, cheapest first: let WebWallGL read the pkg off disk; else
+             read the File into memory ourselves; else use the bytes streamed
+             through DevTools. */
+          let source = null;
+          let via = "none";
+          let pkgLen = 0;
+          if (sceneFile && typeof fileSource === "function") {
+            source = fileSource(sceneFile, pkgProject);
+            via = "file-source";
+            pkgLen = sceneFile.size;
+          } else if (sceneFile) {
+            try { const fileBytes = new Uint8Array(await sceneFile.arrayBuffer()); source = bytesSource(fileBytes, pkgProject, "watchdog:" + wallpaperId); via = "file-buffer"; pkgLen = fileBytes.length; }
+            catch (error) { pushDiag("error", "scene file read failed: " + String(error && error.message || error).slice(0, 120)); }
+          }
+          if (!source && pkgData && pkgData.bytes && pkgData.bytes.length) {
+            source = bytesSource(pkgData.bytes, pkgProject, "watchdog:" + wallpaperId);
+            via = "cdp";
+            pkgLen = pkgData.bytes.length;
+          }
+          if (!source) throw new Error("scene pkg not available (missing scene.pkg?)");
           window.__codexScenePkg = null;
-          const { mount, bytesSource } = window.WebWallGL;
           /* Ask WebWallGL for the top tier it can hold: renderDpr >= 1.5 lifts
              its internal resource cap (textures were sampled at 0.6-0.8x) and
              4x MSAA cleans up edges. The library's own adaptive quality still
@@ -634,7 +759,7 @@ async function installSceneWebGL(found, current) {
           const renderDpr = Math.min(2, Math.max(window.devicePixelRatio || 1, 1.5));
           const quality = { antiAliasing: "msaa4", particles: "high", postProcessing: "high" };
           const mountOptions = extra => ({
-            source: bytesSource(pkgBytes, pkgProject, "watchdog:" + wallpaperId),
+            source,
             renderDpr,
             quality,
             onDiagnostic: (lvl, msg) => pushDiag(lvl, msg),
@@ -686,7 +811,7 @@ async function installSceneWebGL(found, current) {
           ].join("\\n");
           document.head.append(style);
           installGlGuard(quality);
-          return { ok: true, renderMode: "webgl", source: wallpaperId, pkgBytes: pkgLen, mountMs: Math.round(performance.now() - mountStarted), mountRetried: retried, renderDpr, lastDiag: lastDiag(), diagCount: diagCount() };
+          return { ok: true, renderMode: "webgl", source: wallpaperId, via, pkgBytes: pkgLen, mountMs: Math.round(performance.now() - mountStarted), mountRetried: retried, renderDpr, lastDiag: lastDiag(), diagCount: diagCount() };
         };
         /* While the app window is hidden/occluded Chromium freezes rAF, so the
            render loop cannot produce the first frame mount() waits for (the
@@ -694,7 +819,8 @@ async function installSceneWebGL(found, current) {
            fallback right away and upgrade to WebGL the moment the page
            becomes visible again. */
         const oldLayers = previousLayers();
-        if (document.visibilityState === "hidden" && window.__codexSceneFallback && window.__codexSceneFallback.bytes && window.__codexSceneFallback.bytes.length) {
+        const fallbackReady = (() => { const info = window.__codexSceneFiles; const input = document.getElementById(${JSON.stringify(FILE_INPUT_ID)}); if (info && info.fallbackIndex >= 0 && input && input.files && input.files[info.fallbackIndex]) return true; return !!(window.__codexSceneFallback && window.__codexSceneFallback.bytes && window.__codexSceneFallback.bytes.length); })();
+        if (document.visibilityState === "hidden" && fallbackReady) {
           const deferred = renderFallback("window hidden - WebGL mount deferred until the page is visible", oldLayers);
           if (deferred && deferred.ok) {
             document.addEventListener("visibilitychange", () => {
@@ -717,31 +843,42 @@ async function installSceneWebGL(found, current) {
     }, 120000);
   });
   if (result && result.renderMode === "webgl") {
-    log(`scene webgl ${wallpaperId}: renderMode=webgl (vendored WebWallGL, bytesSource pkgBytes=${result.pkgBytes} mountMs=${result.mountMs} preMs=${phaseMs.pre}${result.mountRetried ? " retried=true" : ""}${result.lastDiag ? " lastDiag=" + String(result.lastDiag).slice(0, 160) : ""}${result.diagCount ? " diagCount=" + result.diagCount : ""})`);
+    log(`scene webgl ${wallpaperId}: renderMode=webgl (vendored WebWallGL, via=${result.via} pkgBytes=${result.pkgBytes} mountMs=${result.mountMs} preMs=${phaseMs.pre}${result.mountRetried ? " retried=true" : ""}${result.lastDiag ? " lastDiag=" + String(result.lastDiag).slice(0, 160) : ""}${result.diagCount ? " diagCount=" + result.diagCount : ""})`);
   } else if (result) {
-    log(`scene webgl ${wallpaperId}: renderMode=${result.renderMode}${result.deferredWebGL ? " deferredWebGL=true" : ""}${result.webglError ? " webglError=" + String(result.webglError).slice(0, 180) : ""}${result.fallbackError ? " fallbackError=" + result.fallbackError : ""}${result.fallbackBytes ? " fallbackBytes=" + result.fallbackBytes + " mime=" + result.fallbackMime : ""}${result.error ? " error=" + result.error : ""}${result.lastDiag ? " lastDiag=" + String(result.lastDiag).slice(0, 160) : ""}${result.diagCount ? " diagCount=" + result.diagCount : ""}`);
+    log(`scene webgl ${wallpaperId}: renderMode=${result.renderMode}${result.via ? " via=" + result.via : ""}${result.deferredWebGL ? " deferredWebGL=true" : ""}${result.webglError ? " webglError=" + String(result.webglError).slice(0, 180) : ""}${result.fallbackError ? " fallbackError=" + result.fallbackError : ""}${result.fallbackBytes ? " fallbackBytes=" + result.fallbackBytes + " mime=" + result.fallbackMime : ""}${result.error ? " error=" + result.error : ""}${result.lastDiag ? " lastDiag=" + String(result.lastDiag).slice(0, 160) : ""}${result.diagCount ? " diagCount=" + result.diagCount : ""}`);
   }
   return result;
 }
 async function installBackground(current) {
   const found = await findPage();
   if (!found) throw new Error("Codex main page disappeared");
-  const media = loadMedia(current.source);
+  const media = mediaMeta(current.source);
   if (media.renderMode === "webgl") return await installSceneWebGL(found, current);
   const installEpoch = selectEpoch;
   const isVideo = media.type.startsWith("video/");
-  const mediaBytes = media.buf ? media.buf.length : fs.statSync(media.path).size;
   const nativeRawChunk = 3 * 1024 * 1024;
-  await withPage(found.target, async command => {
-    await command("Runtime.evaluate", { expression: `${INGEST_HELPER}\nwindow.__codexWallpaperBytes = { bytes: new Uint8Array(${mediaBytes}), offset: 0 }; 0`, returnByValue: true });
-    const chunkSource = media.buf ? base64ChunkSourceFromBuffer(media.buf, nativeRawChunk) : base64ChunkSource(media.path, nativeRawChunk);
-    let nativeInjected = true;
-    for (const chunk of chunkSource) {
-      if (selectEpoch !== installEpoch) { log(`install aborted (superseded during native injection): ${current.source}`); nativeInjected = false; break; }
-      try { await command("Runtime.evaluate", { expression: `window.__codexIngest("__codexWallpaperBytes", ${JSON.stringify(chunk)})`, returnByValue: true, awaitPromise: true }); }
-      catch (error) { log(`native inject failed for ${current.source}: ${error.message}`); nativeInjected = false; break; }
+  const result = await withPage(found.target, async command => {
+    /* Preferred path: the page reads the media straight off disk through the
+       file-backed Blob the DOM channel handed the hidden input, so the video or
+       image is never copied through DevTools. The byte stream below is the
+       fallback for when the DOM domain is unavailable. */
+    const primed = await primeWallpaperFiles(command, [media.path]);
+    const fileIndex = primed.ok ? primed.paths.indexOf(media.path) : -1;
+    if (fileIndex < 0) {
+      const mediaBytes = fs.statSync(media.path).size;
+      log(`native ${current.source}: file channel unavailable (${primed.error || "unknown"}), streaming bytes`);
+      await command("Runtime.evaluate", { expression: `${INGEST_HELPER}\nwindow.__codexWallpaperBytes = { bytes: new Uint8Array(${mediaBytes}), offset: 0 }; 0`, returnByValue: true });
+      let nativeInjected = true;
+      for (const chunk of base64ChunkSource(media.path, nativeRawChunk)) {
+        if (selectEpoch !== installEpoch) { log(`install aborted (superseded during native injection): ${current.source}`); nativeInjected = false; break; }
+        try { await command("Runtime.evaluate", { expression: `window.__codexIngest("__codexWallpaperBytes", ${JSON.stringify(chunk)})`, returnByValue: true, awaitPromise: true }); }
+        catch (error) { log(`native inject failed for ${current.source}: ${error.message}`); nativeInjected = false; break; }
+      }
+      if (!nativeInjected) { await command("Runtime.evaluate", { expression: "window.__codexWallpaperBytes = null; 0", returnByValue: true }); return { ok: false, renderMode: "failed", source: current.source }; }
+    } else {
+      await command("Runtime.evaluate", { expression: "window.__codexWallpaperBytes = null; 0", returnByValue: true });
     }
-    if (!nativeInjected) { await command("Runtime.evaluate", { expression: "window.__codexWallpaperBytes = null; 0", returnByValue: true }); return { ok: false, renderMode: "failed", source: current.source }; }
+    const via = fileIndex >= 0 ? "file" : "cdp";
     return await command("Runtime.evaluate", {
       expression: `(async () => {
         const loseGl = (el) => { try { const ctx = el && el.getContext ? (el.getContext("webgl2") || el.getContext("webgl")) : null; if (ctx && ctx.getExtension) { const ext = ctx.getExtension("WEBGL_lose_context"); if (ext) ext.loseContext(); } } catch {} };
@@ -750,9 +887,15 @@ async function installBackground(current) {
         const previousInstance = window.__webwallglInstance;
         window.__webwallglInstance = null;
         document.getElementById("codex-custom-background-base-pending")?.remove();
-        const bytes = window.__codexWallpaperBytes.bytes;
+        const fileIndex = ${JSON.stringify(fileIndex)};
+        const mediaInput = document.getElementById(${JSON.stringify(FILE_INPUT_ID)});
+        const mediaFile = mediaInput && mediaInput.files && fileIndex >= 0 ? mediaInput.files[fileIndex] : null;
+        const bytes = window.__codexWallpaperBytes ? window.__codexWallpaperBytes.bytes : null;
         window.__codexWallpaperBytes = null;
-        const objectUrl = URL.createObjectURL(new Blob([bytes], { type: ${JSON.stringify(media.type)} }));
+        let objectUrl = null, byteLen = 0;
+        if (mediaFile) { objectUrl = URL.createObjectURL(mediaFile); byteLen = mediaFile.size; }
+        else if (bytes && bytes.length) { objectUrl = URL.createObjectURL(new Blob([bytes], { type: ${JSON.stringify(media.type)} })); byteLen = bytes.length; }
+        else return { ok: false, renderMode: "failed", source: ${JSON.stringify(current.source)}, error: "no media bytes" };
         const base = document.createElement("div");
         base.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important;opacity:0";
         base.setAttribute("data-wallpaper-source", ${JSON.stringify(current.source)});
@@ -793,9 +936,10 @@ async function installBackground(current) {
         for (const old of oldLayers) {
           if (!old || !old.isConnected || old === el || old === base) continue;
           const deadCanvas = old.querySelector ? old.querySelector("canvas") : null;
+          const deadUrl = old.getAttribute ? old.getAttribute("data-object-url") : null;
           old.style.transition = "opacity 260ms ease";
           old.style.opacity = "0";
-          setTimeout(() => { try { if (deadCanvas) loseGl(deadCanvas); old.remove(); } catch {} }, 340);
+          setTimeout(() => { try { if (deadCanvas) loseGl(deadCanvas); if (deadUrl) URL.revokeObjectURL(deadUrl); old.remove(); } catch {} }, 340);
         }
         if (previousInstance) setTimeout(() => { try { previousInstance.destroy && previousInstance.destroy(); } catch {} try { previousInstance.unmount && previousInstance.unmount(); } catch {} try { previousInstance.dispose && previousInstance.dispose(); } catch {} }, 360);
         document.getElementById("codex-custom-background-style")?.remove();
@@ -808,12 +952,14 @@ async function installBackground(current) {
         ].join("\\n");
         document.head.append(style);
         if (${JSON.stringify(isVideo)}) el.play().catch(() => {});
-        return { bytes: bytes.length, type: ${JSON.stringify(media.type)}, source: ${JSON.stringify(current.source)} };
+        return { bytes: byteLen, type: ${JSON.stringify(media.type)}, renderMode: ${JSON.stringify(media.renderMode)}, source: ${JSON.stringify(current.source)}, via: ${JSON.stringify(via)} };
       })()`,
       returnByValue: true,
       awaitPromise: true
     });
   });
+  if (result && result.via) log(`native ${current.source}: renderMode=${result.renderMode} via=${result.via} bytes=${result.bytes}`);
+  return result;
 }
 
 /* Quality monitoring. WebWallGL's adaptive controller only ever steps the
