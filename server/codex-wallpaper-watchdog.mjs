@@ -307,6 +307,29 @@ function evictPkgCache() {
     pkgCacheBytes -= entry.bytes.length;
   }
 }
+/* In-page chunk sink shared by the scene pkg, the scene fallback and the native
+   media injection. Uint8Array.fromBase64 decodes a whole chunk in one native
+   call, and the sink yields to the page after every chunk so the outgoing
+   wallpaper keeps painting while the next one is staged - the old inline
+   atob + per-byte loop held the main thread for the entire chunk. */
+const INGEST_HELPER = `window.__codexIngest = async (key, b64) => {
+  const target = window[key];
+  if (!target || !target.bytes) throw new Error("no ingest target " + key);
+  const offset = target.offset;
+  let chunk;
+  if (typeof Uint8Array.fromBase64 === "function") chunk = Uint8Array.fromBase64(b64);
+  else { const binary = atob(b64); chunk = new Uint8Array(binary.length); for (let i = 0; i < binary.length; i++) chunk[i] = binary.charCodeAt(i); }
+  target.bytes.set(chunk, offset);
+  target.offset = offset + chunk.length;
+  await new Promise(resolve => {
+    let done = false;
+    const finish = () => { if (done) return; done = true; clearTimeout(timer); resolve(); };
+    const timer = setTimeout(finish, 250);
+    if (window.scheduler && typeof scheduler.yield === "function") scheduler.yield().then(finish, finish);
+    else requestAnimationFrame(finish);
+  });
+  return chunk.length;
+}; 0`;
 async function installSceneWebGL(found, current) {
   const port = lockPort;
   const wallpaperId = current.source;
@@ -399,12 +422,12 @@ async function installSceneWebGL(found, current) {
   const phaseMs = { pre: 0 };
   const result = await withPage(found.target, async command => {
     const preStartedAt = Date.now();
-    await command("Runtime.evaluate", { expression: `window.__codexSceneFallback = { bytes: new Uint8Array(${fallbackBytes}), offset: 0, mime: ${JSON.stringify(fallbackMime)} }; 0`, returnByValue: true });
+    await command("Runtime.evaluate", { expression: `${INGEST_HELPER}\nwindow.__codexSceneFallback = { bytes: new Uint8Array(${fallbackBytes}), offset: 0, mime: ${JSON.stringify(fallbackMime)} }; 0`, returnByValue: true });
     if (fallbackPath && fallbackBytes > 0) {
       let fallbackInjected = true;
       for (const chunk of base64ChunkSource(fallbackPath, fallbackRawChunk)) {
         if (selectEpoch !== installEpoch) { log(`install aborted (superseded during fallback injection): ${wallpaperId}`); fallbackInjected = false; break; }
-        try { await command("Runtime.evaluate", { expression: `(() => { const b = atob(${JSON.stringify(chunk)}); const o = window.__codexSceneFallback.offset; for (let i = 0; i < b.length; i++) window.__codexSceneFallback.bytes[o + i] = b.charCodeAt(i); window.__codexSceneFallback.offset = o + b.length; })()`, returnByValue: true }); }
+        try { await command("Runtime.evaluate", { expression: `window.__codexIngest("__codexSceneFallback", ${JSON.stringify(chunk)})`, returnByValue: true, awaitPromise: true }); }
         catch (error) { log(`scene fallback inject failed for ${wallpaperId}: ${error.message}`); fallbackInjected = false; break; }
       }
       if (!fallbackInjected) { await command("Runtime.evaluate", { expression: "window.__codexSceneFallback = { bytes: new Uint8Array(0), offset: 0, mime: '' }; 0", returnByValue: true }); }
@@ -424,12 +447,12 @@ async function installSceneWebGL(found, current) {
     if (libraryAvailable && !libCapabilitiesLogged) { try { const apiKeys = await command("Runtime.evaluate", { expression: "window.__webwallglApiKeys || ''", returnByValue: true }); const missing = ["mount", "bytesSource"].filter(k => !apiKeys.includes(k)); log(`webwallgl vendored=${VENDORED_WEBWALLGL_VERSION} api=[${apiKeys}]${missing.length ? " MISSING=" + missing.join(",") : ""}`); libCapabilitiesLogged = true; } catch {} }
 
     if (libraryAvailable && scenePath && sceneBytes > 0) {
-      await command("Runtime.evaluate", { expression: `window.__codexScenePkg = { bytes: new Uint8Array(${sceneBytes}), offset: 0, project: ${JSON.stringify(sceneProject)} }; 0`, returnByValue: true });
+      await command("Runtime.evaluate", { expression: `${INGEST_HELPER}\nwindow.__codexScenePkg = { bytes: new Uint8Array(${sceneBytes}), offset: 0, project: ${JSON.stringify(sceneProject)} }; 0`, returnByValue: true });
       let sceneInjected = true;
       const sceneSource = sceneBuf ? base64ChunkSourceFromBuffer(sceneBuf, sceneRawChunk) : base64ChunkSource(scenePath, sceneRawChunk);
       for (const chunk of sceneSource) {
         if (selectEpoch !== installEpoch) { log(`install aborted (superseded during scene injection): ${wallpaperId}`); sceneInjected = false; break; }
-        try { await command("Runtime.evaluate", { expression: `(() => { const b = atob(${JSON.stringify(chunk)}); const o = window.__codexScenePkg.offset; for (let i = 0; i < b.length; i++) window.__codexScenePkg.bytes[o + i] = b.charCodeAt(i); window.__codexScenePkg.offset = o + b.length; })()`, returnByValue: true }); }
+        try { await command("Runtime.evaluate", { expression: `window.__codexIngest("__codexScenePkg", ${JSON.stringify(chunk)})`, returnByValue: true, awaitPromise: true }); }
         catch (error) { log(`scene pkg inject failed for ${wallpaperId}: ${error.message}`); sceneInjected = false; break; }
       }
       if (!sceneInjected) { await command("Runtime.evaluate", { expression: "window.__codexScenePkg = null; 0", returnByValue: true }); }
@@ -642,12 +665,12 @@ async function installBackground(current) {
   const mediaBytes = media.buf ? media.buf.length : fs.statSync(media.path).size;
   const nativeRawChunk = 3 * 1024 * 1024;
   await withPage(found.target, async command => {
-    await command("Runtime.evaluate", { expression: `window.__codexWallpaperBytes = { bytes: new Uint8Array(${mediaBytes}), offset: 0 }; 0`, returnByValue: true });
+    await command("Runtime.evaluate", { expression: `${INGEST_HELPER}\nwindow.__codexWallpaperBytes = { bytes: new Uint8Array(${mediaBytes}), offset: 0 }; 0`, returnByValue: true });
     const chunkSource = media.buf ? base64ChunkSourceFromBuffer(media.buf, nativeRawChunk) : base64ChunkSource(media.path, nativeRawChunk);
     let nativeInjected = true;
     for (const chunk of chunkSource) {
       if (selectEpoch !== installEpoch) { log(`install aborted (superseded during native injection): ${current.source}`); nativeInjected = false; break; }
-      try { await command("Runtime.evaluate", { expression: `(() => { const b = atob(${JSON.stringify(chunk)}); const o = window.__codexWallpaperBytes.offset; for (let i = 0; i < b.length; i++) window.__codexWallpaperBytes.bytes[o + i] = b.charCodeAt(i); window.__codexWallpaperBytes.offset = o + b.length; })()`, returnByValue: true }); }
+      try { await command("Runtime.evaluate", { expression: `window.__codexIngest("__codexWallpaperBytes", ${JSON.stringify(chunk)})`, returnByValue: true, awaitPromise: true }); }
       catch (error) { log(`native inject failed for ${current.source}: ${error.message}`); nativeInjected = false; break; }
     }
     if (!nativeInjected) { await command("Runtime.evaluate", { expression: "window.__codexWallpaperBytes = null; 0", returnByValue: true }); return { ok: false, renderMode: "failed", source: current.source }; }
