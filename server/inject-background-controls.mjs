@@ -173,36 +173,41 @@ const expression = `(() => {
     markedSurfaces.add(element);
   }
 
-  function clearMarks(registry, attribute) {
+  /* Re-marking used to clear the whole registry first, which rewrote the
+     attribute on every marked node (100+ mutations per injection) and made
+     Chromium recompute style for the entire transcript. Only nodes that drop
+     out of the current pass need their mark removed, so keep the ones re-marked
+     in this pass and prune the rest; the end state is identical. */
+  function clearStaleMarks(registry, attribute, keep) {
     for (const element of [...registry]) {
-      if (!element.isConnected) { registry.delete(element); continue; }
+      if (keep.has(element)) continue;
+      registry.delete(element);
+      if (!element.isConnected) continue;
       try { element.removeAttribute(attribute); } catch {}
     }
   }
 
   function markReadabilityBubbles() {
-    clearMarks(markedBubbles, "data-codex-readability-bubble");
-    markReadabilityBubble(document.querySelector("aside.app-shell-left-panel"), "sidebar");
-    markReadabilityBubble(document.querySelector(".ProseMirror")?.closest('[class*="_ComposerLayoutRoot_"]'), "composer");
-    markReadabilityBubble(document.querySelector("main > header"), "header");
-    document.querySelectorAll('.thread-scroll-container [class*="group/user-message"] [class*="_bubble_"]').forEach(element => {
-      markReadabilityBubble(element, "user");
-    });
-    document.querySelectorAll(".thread-scroll-container [data-markdown-text-style=assistant-message]").forEach(element => {
-      markReadabilityBubble(element.closest(".group.flex.min-w-0.flex-col"), "assistant");
-    });
-    document.querySelectorAll('.thread-scroll-container [class*="group/activity-header"]').forEach(element => {
-      markReadabilityBubble(element.parentElement, "activity");
-    });
+    const keep = new Set();
+    const mark = (element, kind) => { if (!element) return; markReadabilityBubble(element, kind); keep.add(element); };
+    mark(document.querySelector("aside.app-shell-left-panel"), "sidebar");
+    mark(document.querySelector(".ProseMirror")?.closest('[class*="_ComposerLayoutRoot_"]'), "composer");
+    mark(document.querySelector("main > header"), "header");
+    document.querySelectorAll('.thread-scroll-container [class*="group/user-message"] [class*="_bubble_"]').forEach(element => mark(element, "user"));
+    document.querySelectorAll(".thread-scroll-container [data-markdown-text-style=assistant-message]").forEach(element => mark(element.closest(".group.flex.min-w-0.flex-col"), "assistant"));
+    document.querySelectorAll('.thread-scroll-container [class*="group/activity-header"]').forEach(element => mark(element.parentElement, "activity"));
+    clearStaleMarks(markedBubbles, "data-codex-readability-bubble", keep);
   }
 
   function markReadabilitySurfaces() {
-    clearMarks(markedSurfaces, "data-codex-readability-surface");
-    markReadabilitySurface(document.querySelector("aside.app-shell-left-panel"), "sidebar");
-    markReadabilitySurface(document.querySelector('[class*="_ApplicationMenuTopBar_"]'), "topbar");
-    markReadabilitySurface(document.querySelector("main"), "content");
-    markReadabilitySurface(document.querySelector("main > header"), "header");
-    markReadabilitySurface(document.querySelector(".ProseMirror")?.closest('[class*="_ComposerLayoutRoot_"]'), "composer");
+    const keep = new Set();
+    const mark = (element, kind) => { if (!element) return; markReadabilitySurface(element, kind); keep.add(element); };
+    mark(document.querySelector("aside.app-shell-left-panel"), "sidebar");
+    mark(document.querySelector('[class*="_ApplicationMenuTopBar_"]'), "topbar");
+    mark(document.querySelector("main"), "content");
+    mark(document.querySelector("main > header"), "header");
+    mark(document.querySelector(".ProseMirror")?.closest('[class*="_ComposerLayoutRoot_"]'), "composer");
+    clearStaleMarks(markedSurfaces, "data-codex-readability-surface", keep);
   }
 
   function pastelTint(pixels) {

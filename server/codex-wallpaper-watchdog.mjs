@@ -361,27 +361,48 @@ const FILE_INPUT_INIT = `(() => {
   return input.isConnected;
 })()`;
 
+/* Node ids only change when the page reloads, but resolving the input used to
+   cost four DevTools round trips (DOM.enable, DOM.getDocument, DOM.querySelector
+   and a verify evaluate) on every single switch. Remember the id that worked and
+   re-resolve only when it goes stale. */
+let fileInputNodeId = 0;
+let domDomainEnabled = false;
+
+async function resolveFileInputNode(command) {
+  if (!domDomainEnabled) {
+    try { await command("DOM.enable", {}); domDomainEnabled = true; }
+    catch { return 0; }
+  }
+  let rootId = 0;
+  try { const doc = await command("DOM.getDocument", { depth: 1 }); rootId = doc && doc.root ? doc.root.nodeId : 0; } catch { return 0; }
+  if (!rootId) return 0;
+  try { const node = await command("DOM.querySelector", { nodeId: rootId, selector: "#" + FILE_INPUT_ID }); return node && node.nodeId ? node.nodeId : 0; } catch { return 0; }
+}
+
 async function primeFileInput(command, paths) {
   const wanted = [...new Set((paths || []).filter(Boolean))];
   if (!wanted.length) return { ok: false, error: "no files to hand over" };
-  try { await command("Runtime.evaluate", { expression: FILE_INPUT_INIT, returnByValue: true }); }
-  catch (error) { return { ok: false, error: "file input init failed: " + error.message }; }
-  try { await command("DOM.enable", {}); }
-  catch (error) { return { ok: false, error: "DOM.enable failed: " + error.message }; }
-  let rootId = 0;
-  try { const doc = await command("DOM.getDocument", { depth: 2 }); rootId = doc && doc.root ? doc.root.nodeId : 0; }
-  catch (error) { return { ok: false, error: "DOM.getDocument failed: " + error.message }; }
-  if (!rootId) return { ok: false, error: "DOM.getDocument returned no root node" };
-  let nodeId = 0;
-  try { const node = await command("DOM.querySelector", { nodeId: rootId, selector: "#" + FILE_INPUT_ID }); nodeId = node && node.nodeId ? node.nodeId : 0; }
-  catch (error) { return { ok: false, error: "DOM.querySelector failed: " + error.message }; }
-  if (!nodeId) return { ok: false, error: "file input missing from the page" };
-  try { await command("DOM.setFileInputFiles", { files: wanted, nodeId }); }
-  catch (error) { return { ok: false, error: "DOM.setFileInputFiles failed: " + error.message }; }
+  let nodeId = fileInputNodeId;
+  let failure = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (!nodeId) {
+      try { await command("Runtime.evaluate", { expression: FILE_INPUT_INIT, returnByValue: true }); }
+      catch (error) { return { ok: false, error: "file input init failed: " + error.message }; }
+      nodeId = await resolveFileInputNode(command);
+      if (!nodeId) return { ok: false, error: "file input missing from the page" };
+    }
+    try { await command("DOM.setFileInputFiles", { files: wanted, nodeId }); failure = null; break; }
+    catch (error) { failure = error; nodeId = 0; /* stale id (page reloaded): resolve again */ }
+  }
+  if (failure) return { ok: false, error: "DOM.setFileInputFiles failed: " + failure.message };
+  fileInputNodeId = nodeId;
   let seen = null;
   try { seen = await command("Runtime.evaluate", { expression: `(() => { const input = document.getElementById(${JSON.stringify(FILE_INPUT_ID)}); return input && input.files ? Array.from(input.files).map(file => file.name + ":" + file.size) : null; })()`, returnByValue: true }); }
   catch (error) { return { ok: false, error: "file input verify failed: " + error.message }; }
-  if (!Array.isArray(seen) || seen.length !== wanted.length) return { ok: false, error: "file input holds " + (Array.isArray(seen) ? seen.length : "no") + " of " + wanted.length + " file(s)" };
+  if (!Array.isArray(seen) || seen.length !== wanted.length) {
+    fileInputNodeId = 0;
+    return { ok: false, error: "file input holds " + (Array.isArray(seen) ? seen.length : "no") + " of " + wanted.length + " file(s)" };
+  }
   return { ok: true, files: seen };
 }
 
@@ -594,17 +615,41 @@ async function installSceneWebGL(found, current) {
         const pushDiag = (level, msg) => { const text = String(msg || "").slice(0, 200); diagBuffer.push({ level: String(level || "").toUpperCase(), msg: text, t: Math.round(performance.now()) }); if (diagBuffer.length > diagMax) diagBuffer.shift(); };
         const lastDiag = () => { if (!diagBuffer.length) return ""; const last = diagBuffer[diagBuffer.length - 1]; return last.level + ":" + last.msg; };
         const diagCount = () => diagBuffer.length;
-        const injectBaseStyle = () => {
-          document.getElementById("codex-custom-background-style")?.remove();
+        /* The universal "#root *" rule below blanks the whole app shell, so
+           re-inserting the element costs a full-document style recalc (~150-220ms
+           on a busy transcript). The text is constant, so keep the node while it
+           already carries it and only rebuild on an actual change. */
+        const applyStyleOnce = (id, text) => {
+          const existing = document.getElementById(id);
+          if (existing && existing.textContent === text) return;
+          if (existing) existing.remove();
           const style = document.createElement("style");
-          style.id = "codex-custom-background-style";
-          style.textContent = [
-            "html, body, #root, #root *, #root *::before, #root *::after { background: transparent !important; backdrop-filter: none !important; box-shadow: none !important; }",
-            "#root { position: relative !important; z-index: 1 !important; min-height: 100vh !important; }",
-            "#codex-custom-background-media { display: block !important; visibility: visible !important; }"
-          ].join("\\n");
+          style.id = id;
+          style.textContent = text;
           document.head.append(style);
         };
+        /* One shared stylesheet text for every render path. The rules below match
+           #root * across the whole app shell, so rewriting the sheet invalidates style
+           for every node (~150-220ms on a busy transcript). Native and WebGL used to
+           carry slightly different copies, so every native<->webgl switch rebuilt the
+           sheet; with identical text applyStyleOnce leaves the existing node in place. */
+        const BACKGROUND_STYLE_TEXT = [
+          "html, body, #root, #root *, #root *::before, #root *::after { background: transparent !important; backdrop-filter: none !important; box-shadow: none !important; }",
+          "#root { position: relative !important; z-index: 1 !important; min-height: 100vh !important; }",
+          "#codex-custom-background-media { display: block !important; visibility: visible !important; }",
+          "#codex-custom-background-base, #codex-custom-background-base-pending { display: block !important; visibility: visible !important; width: 100vw !important; height: 100vh !important; }",
+          "#codex-custom-background-base canvas, #codex-custom-background-base-pending canvas { display: block !important; visibility: visible !important; width: 100vw !important; height: 100vh !important; }"
+        ].join("\\n");
+        /* Releasing an outgoing background (GL context, dead layers, instance) is
+           real main-thread work. Run it when the page is idle instead of in the
+           frames right after the swap; the timeout keeps it bounded. Separate
+           deadlines keep the two jobs in separate tasks. */
+        const whenIdle = (fn, timeoutMs) => {
+          const run = () => { try { fn(); } catch {} };
+          try { if (typeof window.requestIdleCallback === "function") { window.requestIdleCallback(run, { timeout: timeoutMs }); return; } } catch {}
+          setTimeout(run, timeoutMs);
+        };
+        const injectBaseStyle = () => applyStyleOnce("codex-custom-background-style", BACKGROUND_STYLE_TEXT);
         /* Cross-fade plumbing. The currently visible layers are captured up
            front and left alone (still rendering) while the replacement is
            staged at opacity 0; once it is ready we swap the ids into place and
@@ -627,7 +672,7 @@ async function installSceneWebGL(found, current) {
             const deadCanvas = el.querySelector ? el.querySelector("canvas") : null;
             el.style.transition = "opacity 260ms ease";
             el.style.opacity = "0";
-            setTimeout(() => { try { if (deadCanvas) loseGl(deadCanvas); el.remove(); } catch {} }, 340);
+            whenIdle(() => { try { if (deadCanvas) loseGl(deadCanvas); el.remove(); } catch {} }, 700);
           }
         };
         const renderFallback = (reason, oldLayers) => {
@@ -798,18 +843,9 @@ async function installSceneWebGL(found, current) {
           mediaEl.style.cssText = "position:fixed!important;inset:0!important;z-index:0!important;pointer-events:none!important;opacity:1";
           revealBackground(document.getElementById(PENDING_BASE_ID) || base, mediaEl, oldLayers);
           if (previousInstance && previousInstance !== inst) {
-            setTimeout(() => { try { previousInstance.destroy && previousInstance.destroy(); } catch {} try { previousInstance.unmount && previousInstance.unmount(); } catch {} try { previousInstance.dispose && previousInstance.dispose(); } catch {} }, 360);
+            whenIdle(() => { try { previousInstance.destroy && previousInstance.destroy(); } catch {} try { previousInstance.unmount && previousInstance.unmount(); } catch {} try { previousInstance.dispose && previousInstance.dispose(); } catch {} }, 1000);
           }
-          document.getElementById("codex-custom-background-style")?.remove();
-          const style = document.createElement("style");
-          style.id = "codex-custom-background-style";
-          style.textContent = [
-            "html, body, #root, #root *, #root *::before, #root *::after { background: transparent !important; backdrop-filter: none !important; box-shadow: none !important; }",
-            "#root { position: relative !important; z-index: 1 !important; min-height: 100vh !important; }",
-            "#codex-custom-background-base, #codex-custom-background-base-pending { display: block !important; visibility: visible !important; width: 100vw !important; height: 100vh !important; }",
-            "#codex-custom-background-base canvas, #codex-custom-background-base-pending canvas { display: block !important; visibility: visible !important; width: 100vw !important; height: 100vh !important; }"
-          ].join("\\n");
-          document.head.append(style);
+          applyStyleOnce("codex-custom-background-style", BACKGROUND_STYLE_TEXT);
           installGlGuard(quality);
           return { ok: true, renderMode: "webgl", source: wallpaperId, via, pkgBytes: pkgLen, mountMs: Math.round(performance.now() - mountStarted), mountRetried: retried, renderDpr, lastDiag: lastDiag(), diagCount: diagCount() };
         };
@@ -933,24 +969,42 @@ async function installBackground(current) {
         });
         el.style.opacity = "1";
         base.style.opacity = "1";
+        const applyStyleOnce = (id, text) => {
+          const existing = document.getElementById(id);
+          if (existing && existing.textContent === text) return;
+          if (existing) existing.remove();
+          const style = document.createElement("style");
+          style.id = id;
+          style.textContent = text;
+          document.head.append(style);
+        };
+        /* One shared stylesheet text for every render path. The rules below match
+           #root * across the whole app shell, so rewriting the sheet invalidates style
+           for every node (~150-220ms on a busy transcript). Native and WebGL used to
+           carry slightly different copies, so every native<->webgl switch rebuilt the
+           sheet; with identical text applyStyleOnce leaves the existing node in place. */
+        const BACKGROUND_STYLE_TEXT = [
+          "html, body, #root, #root *, #root *::before, #root *::after { background: transparent !important; backdrop-filter: none !important; box-shadow: none !important; }",
+          "#root { position: relative !important; z-index: 1 !important; min-height: 100vh !important; }",
+          "#codex-custom-background-media { display: block !important; visibility: visible !important; }",
+          "#codex-custom-background-base, #codex-custom-background-base-pending { display: block !important; visibility: visible !important; width: 100vw !important; height: 100vh !important; }",
+          "#codex-custom-background-base canvas, #codex-custom-background-base-pending canvas { display: block !important; visibility: visible !important; width: 100vw !important; height: 100vh !important; }"
+        ].join("\\n");
+        const whenIdle = (fn, timeoutMs) => {
+          const run = () => { try { fn(); } catch {} };
+          try { if (typeof window.requestIdleCallback === "function") { window.requestIdleCallback(run, { timeout: timeoutMs }); return; } } catch {}
+          setTimeout(run, timeoutMs);
+        };
         for (const old of oldLayers) {
           if (!old || !old.isConnected || old === el || old === base) continue;
           const deadCanvas = old.querySelector ? old.querySelector("canvas") : null;
           const deadUrl = old.getAttribute ? old.getAttribute("data-object-url") : null;
           old.style.transition = "opacity 260ms ease";
           old.style.opacity = "0";
-          setTimeout(() => { try { if (deadCanvas) loseGl(deadCanvas); if (deadUrl) URL.revokeObjectURL(deadUrl); old.remove(); } catch {} }, 340);
+          whenIdle(() => { try { if (deadCanvas) loseGl(deadCanvas); if (deadUrl) URL.revokeObjectURL(deadUrl); old.remove(); } catch {} }, 700);
         }
-        if (previousInstance) setTimeout(() => { try { previousInstance.destroy && previousInstance.destroy(); } catch {} try { previousInstance.unmount && previousInstance.unmount(); } catch {} try { previousInstance.dispose && previousInstance.dispose(); } catch {} }, 360);
-        document.getElementById("codex-custom-background-style")?.remove();
-        const style = document.createElement("style");
-        style.id = "codex-custom-background-style";
-        style.textContent = [
-          "html, body, #root, #root *, #root *::before, #root *::after { background: transparent !important; backdrop-filter: none !important; box-shadow: none !important; }",
-          "#root { position: relative !important; z-index: 1 !important; min-height: 100vh !important; }",
-          "#codex-custom-background-media { display: block !important; visibility: visible !important; }"
-        ].join("\\n");
-        document.head.append(style);
+        if (previousInstance) whenIdle(() => { try { previousInstance.destroy && previousInstance.destroy(); } catch {} try { previousInstance.unmount && previousInstance.unmount(); } catch {} try { previousInstance.dispose && previousInstance.dispose(); } catch {} }, 1000);
+        applyStyleOnce("codex-custom-background-style", BACKGROUND_STYLE_TEXT);
         if (${JSON.stringify(isVideo)}) el.play().catch(() => {});
         return { bytes: byteLen, type: ${JSON.stringify(media.type)}, renderMode: ${JSON.stringify(media.renderMode)}, source: ${JSON.stringify(current.source)}, via: ${JSON.stringify(via)} };
       })()`,
