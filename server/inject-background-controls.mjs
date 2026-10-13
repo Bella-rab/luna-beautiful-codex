@@ -106,27 +106,52 @@ const expression = `(() => {
   const close = shadow.querySelector(".close");
   let readabilityMode = "soft";
 
+  /* Controls are re-injected after every background swap because the panel has
+     to rebind to the new media element, but the sheets and markers it writes are
+     almost always byte-identical to what is already there. Re-assigning
+     identical textContent still makes Chromium re-parse the sheet and
+     invalidate style for the whole tree, which showed up as a ~150ms long task
+     per injection, so every write below is guarded by a value comparison. The
+     stylesheet cache lives on window so it survives re-injection. */
+  const cssCache = window.__codexLastCss || (window.__codexLastCss = {});
+  function writeCss(id, text) {
+    let style = document.getElementById(id);
+    if (style && cssCache[id] === text && style.textContent === text) return style;
+    if (!style) {
+      style = document.createElement("style");
+      style.id = id;
+      document.head.append(style);
+    }
+    if (style.textContent !== text) style.textContent = text;
+    cssCache[id] = text;
+    return style;
+  }
+  function setText(node, text) {
+    if (node && node.textContent !== text) node.textContent = text;
+  }
+  function setAttr(element, name, value) {
+    if (element && element.getAttribute(name) !== value) element.setAttribute(name, value);
+  }
+
   function render(value) {
-    range.value = value;
-    output.textContent = value + "%";
+    if (range.value !== String(value)) range.value = value;
+    setText(output, value + "%");
   }
 
   function apply(value) {
     const percent = Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
     render(percent);
     if (!media) {
-      status.textContent = "当前没有背景";
+      setText(status, "当前没有背景");
       return;
     }
     let base = document.getElementById("codex-custom-background-base");
     if (!base) { base = document.createElement("div"); base.id = "codex-custom-background-base"; base.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important"; media.before(base); }
-    const opacityStyle = document.getElementById("codex-background-opacity-style") ?? document.createElement("style");
-    opacityStyle.id = "codex-background-opacity-style";
-    opacityStyle.textContent = "#codex-custom-background-media,#codex-custom-background-base,#codex-custom-background-base canvas{opacity:" + percent / 100 + " !important}";
-    document.head.append(opacityStyle);
-    media.setAttribute("data-background-opacity", String(percent / 100));
+    const opacityStyle = writeCss("codex-background-opacity-style", "#codex-custom-background-media,#codex-custom-background-base,#codex-custom-background-base canvas{opacity:" + percent / 100 + " !important}");
+    if (opacityStyle.parentNode !== document.head) document.head.append(opacityStyle);
+    setAttr(media, "data-background-opacity", String(percent / 100));
     if (media.tagName === "VIDEO") media.play().catch(() => {});
-    status.textContent = percent === 100 ? "壁纸完全显示" : percent === 0 ? "背景已隐藏" : "已应用 " + percent + "%";
+    setText(status, percent === 100 ? "壁纸完全显示" : percent === 0 ? "背景已隐藏" : "已应用 " + percent + "%");
   }
 
   /* Marked elements are remembered in a registry: clearing marks used to walk
@@ -138,13 +163,13 @@ const expression = `(() => {
 
   function markReadabilityBubble(element, kind) {
     if (!element) return;
-    element.setAttribute("data-codex-readability-bubble", kind);
+    if (element.getAttribute("data-codex-readability-bubble") !== kind) element.setAttribute("data-codex-readability-bubble", kind);
     markedBubbles.add(element);
   }
 
   function markReadabilitySurface(element, kind) {
     if (!element) return;
-    element.setAttribute("data-codex-readability-surface", kind);
+    if (element.getAttribute("data-codex-readability-surface") !== kind) element.setAttribute("data-codex-readability-surface", kind);
     markedSurfaces.add(element);
   }
 
@@ -272,8 +297,8 @@ const expression = `(() => {
 
   function applyReadability(value) {
     const percent = Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
-    readabilityRange.value = percent;
-    readabilityOutput.textContent = percent + "%";
+    if (readabilityRange.value !== String(percent)) readabilityRange.value = percent;
+    setText(readabilityOutput, percent + "%");
     let layer = document.getElementById("codex-background-readability");
     if (!layer) {
       layer = document.createElement("div");
@@ -281,18 +306,13 @@ const expression = `(() => {
       media?.after(layer);
     }
     const strength = percent / 100;
-    document.body.dataset.codexReadabilityMode = readabilityMode;
-    layer.style.cssText = "position:fixed!important;inset:0!important;z-index:0!important;pointer-events:none!important;background:none!important";
-    let readabilityStyle = document.getElementById("codex-background-readability-style");
-    if (!readabilityStyle) {
-      readabilityStyle = document.createElement("style");
-      readabilityStyle.id = "codex-background-readability-style";
-      document.head.append(readabilityStyle);
-    }
+    if (document.body.dataset.codexReadabilityMode !== readabilityMode) document.body.dataset.codexReadabilityMode = readabilityMode;
+    const layerCss = "position:fixed!important;inset:0!important;z-index:0!important;pointer-events:none!important;background:none!important";
+    if (layer.style.cssText !== layerCss) layer.style.cssText = layerCss;
     const softAlpha = 0.16 + strength * 0.26;
     const bubbleAlpha = 0.24 + strength * 0.30;
     const haloAlpha = readabilityMode === "halo" ? 0.62 + strength * 0.30 : 0.24 + strength * 0.24;
-    readabilityStyle.textContent = [
+    const readabilityCss = [
       "#root,#root *,#root *:not(#codex-force-white){color:#fff!important;caret-color:#fff!important}",
       "#root ::placeholder{color:rgba(255,255,255,.72)!important}",
       "#root ::selection{background:rgba(56,189,248,.42)!important;color:#fff!important}",
@@ -308,7 +328,8 @@ const expression = `(() => {
       "body[data-codex-readability-mode=bubble] #root aside[data-codex-readability-bubble]{border-radius:0 28px 28px 0!important}",
       "body[data-codex-readability-mode=bubble] #root [data-codex-readability-bubble=composer]{border-radius:24px!important}",
       "body[data-codex-readability-mode=bubble] #root [data-codex-readability-bubble=user]{border-radius:18px!important}"
-    ].join("\\n");
+    ];
+    writeCss("codex-background-readability-style", readabilityCss.join("\\n"));
   }
 
   if (!media) {
@@ -362,7 +383,9 @@ const expression = `(() => {
   document.body.append(host);
   clearInterval(window.__codexBubbleTintTimer);
   window.__codexBubbleTintTimer = null;
-  updateBubbleTint();
+  /* syncBubbleTintTimer samples once itself whenever bubble mode is active, so
+     the unconditional sample that used to run here only cost a 4K video
+     readback (measured ~26ms) on every injection while it was off screen. */
   syncBubbleTintTimer();
   markReadabilityBubbles();
   markReadabilitySurfaces();

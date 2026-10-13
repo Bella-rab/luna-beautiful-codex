@@ -20,6 +20,26 @@ let libCapabilitiesLogged = false;
 const mediaCache = new Map();
 let memorySelection = null;
 let lastDeferredUpgrade = null;
+const REQUESTED_QUALITY = { antiAliasing: "msaa4", particles: "high", postProcessing: "high" };
+const QUALITY_SCENE_FPS = 60;
+const QUALITY_RESTORE_RATIO = 0.85;
+const QUALITY_RESTORE_HOLD_MS = 5000;
+const QUALITY_RESTORE_COOLDOWN_MS = 30000;
+const QUALITY_FPS_WINDOW_MS = 10000;
+const QUALITY_FPS_MIN_SAMPLES = 5;
+const QUALITY_HOLD_MIN_MS = 60000;
+const QUALITY_RESTORE_MAX_COOLDOWN_MS = 300000;
+const CONTEXT_REMOUNT_GRACE_MS = 6000;
+const CONTEXT_REMOUNT_COOLDOWN_MS = 20000;
+const CONTEXT_REMOUNT_MAX = 3;
+let lastContextRemount = 0;
+let contextRemounts = 0;
+let contextLostSeenAt = 0;
+const qualityFpsWindow = [];
+let lastQualityRestoreAt = 0;
+let qualityBackoff = QUALITY_RESTORE_COOLDOWN_MS;
+let qualityBackoffMountSeq = -1;
+let lastQuality = null;
 
 function log(message) {
   try { fs.appendFileSync(logPath, `[${new Date().toISOString()}] ${message}\n`); } catch {}
@@ -114,7 +134,7 @@ async function acquireServer() {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify(prefs()));
         } else if (url.pathname === "/status") {
-          const payload = { selection: selection(), prefs: prefs(), pid: process.pid, deferredUpgrade: lastDeferredUpgrade };
+          const payload = { selection: selection(), prefs: prefs(), pid: process.pid, deferredUpgrade: lastDeferredUpgrade, quality: lastQuality, contextRemounts };
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify(payload));
         } else if (url.pathname.startsWith("/scene-fallback/")) {
@@ -221,6 +241,13 @@ async function status() {
       picker: !!document.getElementById("codex-wallpaper-picker"),
       whiteText: !!document.getElementById("codex-force-white-style"),
       deferredUpgrade: (() => { const v = window.__codexDeferredWebGL || null; if (v) { const d = window.__codexDeferredDiag || ""; window.__codexDeferredWebGL = null; window.__codexDeferredDiag = null; return { result: v, lastDiag: d }; } return null; })(),
+      contextLost: window.__codexContextLost || null,
+      contextEvents: (() => { const queue = window.__codexContextEvents || []; window.__codexContextEvents = []; return queue.slice(-20); })(),
+      quality: window.__webwallglInstance && typeof window.__webwallglInstance.getQuality === "function" ? window.__webwallglInstance.getQuality() : null,
+      qualityRequested: window.__codexQualityRequested || null,
+      stats: window.__webwallglInstance && window.__webwallglInstance.stats ? { fps: window.__webwallglInstance.stats.fps, running: window.__webwallglInstance.stats.running, idle: window.__webwallglInstance.stats.idle, occluded: window.__webwallglInstance.stats.occluded, throttled: window.__webwallglInstance.stats.throttled } : null,
+      mountSeq: window.__codexMountSeq || 0,
+      visibility: document.visibilityState,
       pickerCommand: (() => {
         const picker = document.getElementById("codex-wallpaper-picker");
         const command = picker?.dataset.command || "";
@@ -538,15 +565,55 @@ async function installSceneWebGL(found, current) {
           if (isVideo) fb.play().catch(() => {});
           return { ok: true, renderMode: "fallback", webglError: String(reason), source: wallpaperId, fallbackBytes: usedBytes, fallbackMime: usedMime };
         };
+        /* One page-wide guard for WEBGL context loss. Installed once and
+           intentionally listening on document (capture) so it survives the
+           background swaps that replace the canvas: the live instance is
+           resolved at event time. Only a loss on the canvas the current
+           WebWallGL instance renders into counts - the loseContext() calls this
+           plugin makes while tearing down an outgoing background must not look
+           like a failure. The page attempts an in-place rebuild first and only
+           reports the loss to the watchdog when that does not take. */
+        const installGlGuard = requestedQuality => {
+          if (!window.__codexGlGuardInstalled) {
+            window.__codexGlGuardInstalled = true;
+            window.__codexContextEvents = window.__codexContextEvents || [];
+            const note = (kind, extra) => { try { const queue = window.__codexContextEvents; queue.push({ kind, t: Date.now(), source: document.getElementById("codex-custom-background-media")?.getAttribute("data-wallpaper-source") || null, ...extra }); if (queue.length > 40) queue.shift(); } catch {} };
+            const rebuild = () => { window.__codexSuppressGlLossUntil = Date.now() + 3000; const live = window.__webwallglInstance; if (!live || typeof live.restore !== "function") { note("restore-skip"); return false; } live.restore(); return true; };
+            const verify = attempt => {
+              setTimeout(() => {
+                let lost = true;
+                try { const live = window.__webwallglInstance; const canvas = live && live.canvas; const gl = canvas && canvas.getContext ? (canvas.getContext("webgl2") || canvas.getContext("webgl")) : null; lost = gl ? !!gl.isContextLost() : true; } catch {}
+                if (!lost) { window.__codexContextLost = null; note("restore-ok"); return; }
+                if (attempt < 2) { note("restore-retry", { attempt }); try { rebuild(); } catch (error) { note("restore-fail", { attempt, message: String(error && error.message || error).slice(0, 160) }); } verify(attempt + 1); return; }
+                note("restore-fail", { attempt });
+              }, 700 + attempt * 500);
+            };
+            document.addEventListener("webglcontextlost", event => {
+              try {
+                const live = window.__webwallglInstance;
+                if (!live || !live.canvas || event.target !== live.canvas || !live.canvas.isConnected) { note("lost-ignored"); return; }
+                if (window.__codexSuppressGlLossUntil && Date.now() < window.__codexSuppressGlLossUntil) { note("lost-suppressed"); return; }
+                window.__codexContextLost = { t: Date.now(), source: document.getElementById("codex-custom-background-media")?.getAttribute("data-wallpaper-source") || null };
+                note("lost");
+                setTimeout(() => { try { rebuild(); } catch (error) { note("restore-fail", { attempt: 0, message: String(error && error.message || error).slice(0, 160) }); } verify(1); }, 60);
+              } catch (error) { note("lost-handler-error", { message: String(error && error.message || error).slice(0, 160) }); }
+            }, true);
+            document.addEventListener("webglcontextrestored", () => note("restored"), true);
+          }
+          try { window.__codexQualityRequested = { ...requestedQuality }; window.__codexMountSeq = (window.__codexMountSeq || 0) + 1; window.__codexContextLost = null; } catch {}
+        };
         const mountWebGL = async (oldLayers) => {
           dropPending();
           if (!libraryAvailable) {
             return renderFallback(window.__webwallglLibError ? ("WebWallGL library error: " + window.__webwallglLibError) : "WebWallGL library not vendored (offline environment)", oldLayers);
           }
-          const tc = document.createElement("canvas");
-          const testCtx = tc.getContext("webgl2");
-          if (!testCtx) return renderFallback("WebGL2 not available", oldLayers);
-          try { testCtx.getExtension("WEBGL_lose_context")?.loseContext(); } catch {}
+          if (window.__codexWebgl2Available === undefined) {
+            const probe = document.createElement("canvas");
+            const probeCtx = probe.getContext("webgl2");
+            window.__codexWebgl2Available = !!probeCtx;
+            try { probeCtx?.getExtension("WEBGL_lose_context")?.loseContext(); } catch {}
+          }
+          if (!window.__codexWebgl2Available) return renderFallback("WebGL2 not available", oldLayers);
           const previousInstance = window.__webwallglInstance;
           const base = document.createElement("div");
           base.id = PENDING_BASE_ID;
@@ -618,6 +685,7 @@ async function installSceneWebGL(found, current) {
             "#codex-custom-background-base canvas, #codex-custom-background-base-pending canvas { display: block !important; visibility: visible !important; width: 100vw !important; height: 100vh !important; }"
           ].join("\\n");
           document.head.append(style);
+          installGlGuard(quality);
           return { ok: true, renderMode: "webgl", source: wallpaperId, pkgBytes: pkgLen, mountMs: Math.round(performance.now() - mountStarted), mountRetried: retried, renderDpr, lastDiag: lastDiag(), diagCount: diagCount() };
         };
         /* While the app window is hidden/occluded Chromium freezes rAF, so the
@@ -680,6 +748,7 @@ async function installBackground(current) {
         const previousLayers = () => ["codex-custom-background-base", "codex-custom-background-media"].map(id => document.getElementById(id)).filter(Boolean);
         const oldLayers = previousLayers();
         const previousInstance = window.__webwallglInstance;
+        window.__webwallglInstance = null;
         document.getElementById("codex-custom-background-base-pending")?.remove();
         const bytes = window.__codexWallpaperBytes.bytes;
         window.__codexWallpaperBytes = null;
@@ -747,6 +816,39 @@ async function installBackground(current) {
   });
 }
 
+/* Quality monitoring. WebWallGL's adaptive controller only ever steps the
+   post-processing tier down (onDowngrade over a 3s window below 85% of the
+   frame cap) and never steps it back up. The facade's setQuality() does still
+   re-apply a tier - it feeds the resolved options straight into the scene's
+   effective-quality setter - so once the page has held >=85% of the cap for 5s
+   the requested tier is re-applied. Measured on the live page: setQuality()
+   moves postProcessing off->high and it holds; restore() (a surface rebuild)
+   does NOT and in fact settles lower, so it is deliberately not used here.
+   Attempts are cooldown-gated rather than once-per-mount so a scene downgraded
+   again hours later can recover, and every attempt is logged and surfaced in
+   /status. */
+async function pageEval(expression, timeoutMs = 20000) {
+  const found = await findPage();
+  if (!found) return null;
+  return await withPage(found.target, command => command("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, timeoutMs));
+}
+async function attemptQualityRestore(current, effective, fps) {
+  const heldMs = qualityFpsWindow.length > 1 ? Math.round(Date.now() - qualityFpsWindow[0].t) : 0;
+  log(`quality degraded on ${current.source}: postProcessing=${effective && effective.postProcessing} (aa=${effective && effective.antiAliasing} particles=${effective && effective.particles}); re-applying the requested tier after ${heldMs}ms at ${fps.toFixed(1)}fps`);
+  const result = await pageEval(`(() => {
+    const instance = window.__webwallglInstance;
+    if (!instance || typeof instance.setQuality !== "function") return { outcome: "no-instance" };
+    const requested = ${JSON.stringify(REQUESTED_QUALITY)};
+    const before = instance.getQuality ? instance.getQuality() : null;
+    if (before && !Object.keys(requested).some(key => before[key] !== requested[key])) return { outcome: "already-requested", before };
+    try { instance.setQuality(requested); } catch (error) { return { outcome: "error", before, message: String(error && error.message || error).slice(0, 160) }; }
+    const after = instance.getQuality ? instance.getQuality() : null;
+    const restored = !!after && Object.keys(requested).every(key => after[key] === requested[key]);
+    return { outcome: restored ? "restored" : "not-restored", before, after };
+  })()`);
+  log(`quality re-apply ${JSON.stringify(result)}: ${current.source}`);
+  return result;
+}
 let restoring = false;
 let selectEpoch = 0;
 /* Polling every 2s made every switch feel sluggish even after the scan cache
@@ -796,7 +898,81 @@ for (;;) {
     else if (!state.page) { lastWhite = null; }
     if (state.page && state.deferredUpgrade) { lastDeferredUpgrade = state.deferredUpgrade; log(`deferred webgl upgrade ${current.source}: result=${state.deferredUpgrade.result}${state.deferredUpgrade.lastDiag ? " lastDiag=" + String(state.deferredUpgrade.lastDiag).slice(0, 160) : ""}`); }
     if (!current.source) { await wait(5000); continue; }
-    const needsBackground = state.page && (!state.background || !state.base || state.source !== current.source);
+
+    /* WebGL context loss. The page-side guard rebuilds the scene in place and
+       reports the outcome through __codexContextEvents / __codexContextLost;
+       log every event, and if the page-side repair did not take within the
+       grace window, remount the selection here. */
+    if (state.page && Array.isArray(state.contextEvents) && state.contextEvents.length) {
+      for (const event of state.contextEvents) log(`webgl context ${event.kind}${event.source ? " source=" + event.source : ""}${event.message ? " (" + String(event.message).slice(0, 160) + ")" : ""}`);
+    }
+    let contextRecovery = false;
+    if (state.page && state.contextLost) {
+      const now = Date.now();
+      if (!contextLostSeenAt) { contextLostSeenAt = now; log(`context loss reported for ${current.source}; waiting ${CONTEXT_REMOUNT_GRACE_MS}ms for the page-side rebuild before remounting`); }
+      if (now - contextLostSeenAt >= CONTEXT_REMOUNT_GRACE_MS && now - lastContextRemount >= CONTEXT_REMOUNT_COOLDOWN_MS) {
+        lastContextRemount = now;
+        if (contextRemounts < CONTEXT_REMOUNT_MAX) {
+          contextRemounts += 1;
+          contextRecovery = true;
+          log(`context loss not repaired in the page: remounting ${current.source} (attempt ${contextRemounts}/${CONTEXT_REMOUNT_MAX})`);
+        } else {
+          log(`context loss still reported for ${current.source} but the remount budget is exhausted; leaving the page as-is`);
+        }
+      }
+    } else if (contextLostSeenAt || contextRemounts > 0) {
+      contextLostSeenAt = 0;
+      if (state.page && state.background && state.source === current.source) contextRemounts = 0;
+    }
+
+    /* Adaptive quality only steps down in the library, so re-apply the
+       requested tier once the page has been comfortably fast for a while. A
+       rolling window is used instead of "N consecutive samples above the bar"
+       because a borderline scene crosses the threshold every few samples, which
+       keeps resetting a consecutive timer and leaves the scene degraded forever
+       - the exact complaint this fixes. When the window averages at or above
+       85% of the cap for 5s the tier goes back on; a cooldown bounds how often
+       that can happen. */
+    if (state.page && state.quality && state.qualityRequested) {
+      if (qualityBackoffMountSeq !== state.mountSeq) { qualityBackoffMountSeq = state.mountSeq; qualityBackoff = QUALITY_RESTORE_COOLDOWN_MS; }
+      const downgraded = ["antiAliasing", "particles", "postProcessing"].some(key => state.quality[key] !== state.qualityRequested[key]);
+      const stats = state.stats || null;
+      const fps = stats && Number.isFinite(stats.fps) ? stats.fps : null;
+      const busy = !stats || stats.occluded === true || stats.running === false;
+      lastQuality = { requested: state.qualityRequested, effective: state.quality, downgraded, fps: fps === null ? null : Math.round(fps * 10) / 10, sceneFps: QUALITY_SCENE_FPS, mountSeq: state.mountSeq, secondsSinceRestore: lastQualityRestoreAt ? Math.round((Date.now() - lastQualityRestoreAt) / 1000) : null };
+      if (!downgraded || busy || fps === null || state.visibility !== "visible") {
+        qualityFpsWindow.length = 0;
+      } else {
+        const now = Date.now();
+        qualityFpsWindow.push({ t: now, fps });
+        while (qualityFpsWindow.length && now - qualityFpsWindow[0].t > QUALITY_FPS_WINDOW_MS) qualityFpsWindow.shift();
+        const avgFps = qualityFpsWindow.reduce((sum, sample) => sum + sample.fps, 0) / qualityFpsWindow.length;
+        const heldMs = qualityFpsWindow.length > 1 ? now - qualityFpsWindow[0].t : 0;
+        lastQuality.avgFps = Math.round(avgFps * 10) / 10;
+        lastQuality.samples = qualityFpsWindow.length;
+        if (!restoring && heldMs >= QUALITY_RESTORE_HOLD_MS && qualityFpsWindow.length >= QUALITY_FPS_MIN_SAMPLES && avgFps >= QUALITY_SCENE_FPS * QUALITY_RESTORE_RATIO && now - lastQualityRestoreAt >= qualityBackoff) {
+          /* Thrash guard: a scene sitting right on the frame cap will be
+             downgraded again immediately after the tier goes back on. Every
+             re-apply that did not hold for a minute doubles the wait, so a
+             borderline scene settles into a slow cadence instead of flickering
+             between tiers. A scene that holds the tier resets it to the floor. */
+          const sinceLast = lastQualityRestoreAt ? now - lastQualityRestoreAt : Infinity;
+          qualityBackoff = sinceLast < QUALITY_HOLD_MIN_MS ? Math.min(qualityBackoff * 2, QUALITY_RESTORE_MAX_COOLDOWN_MS) : QUALITY_RESTORE_COOLDOWN_MS;
+          lastQualityRestoreAt = now;
+          lastQuality.cooldownMs = qualityBackoff;
+          try { lastQuality.reapplied = await attemptQualityRestore(current, state.quality, avgFps); } catch (error) { log(`quality re-apply failed: ${error.message}`); }
+          qualityFpsWindow.length = 0;
+        }
+      }
+    } else {
+      /* No live WebGL instance (native wallpaper, or no page): drop the stale
+         reading so /status does not report a tier for a background that has no
+         WebGL post-processing at all. */
+      qualityFpsWindow.length = 0;
+      lastQuality = null;
+    }
+
+    const needsBackground = state.page && (contextRecovery || !state.background || !state.base || state.source !== current.source);
     const needsControls = state.page && (!state.readability || !state.controls);
     const needsPicker = state.page && !state.picker;
     if (!restoring && (needsBackground || (needsControls && !controlsRunning) || (needsPicker && !pickerRunning))) {
