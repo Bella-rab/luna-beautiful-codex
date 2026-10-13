@@ -129,31 +129,41 @@ const expression = `(() => {
     status.textContent = percent === 100 ? "壁纸完全显示" : percent === 0 ? "背景已隐藏" : "已应用 " + percent + "%";
   }
 
+  /* Marked elements are remembered in a registry: clearing marks used to walk
+     every node in the document, and the per-element white/caret inline styles
+     duplicated the stylesheet rule in applyReadability - both ran on every
+     DOM mutation while the thread was streaming. */
+  const markedBubbles = new Set();
+  const markedSurfaces = new Set();
+
   function markReadabilityBubble(element, kind) {
-    if (element && !element.hasAttribute("data-codex-readability-bubble")) {
-      element.setAttribute("data-codex-readability-bubble", kind);
-    }
+    if (!element) return;
+    element.setAttribute("data-codex-readability-bubble", kind);
+    markedBubbles.add(element);
   }
 
   function markReadabilitySurface(element, kind) {
-    if (element) element.setAttribute("data-codex-readability-surface", kind);
+    if (!element) return;
+    element.setAttribute("data-codex-readability-surface", kind);
+    markedSurfaces.add(element);
+  }
+
+  function clearMarks(registry, attribute) {
+    for (const element of [...registry]) {
+      if (!element.isConnected) { registry.delete(element); continue; }
+      try { element.removeAttribute(attribute); } catch {}
+    }
   }
 
   function markReadabilityBubbles() {
-    document.querySelectorAll("[data-codex-readability-bubble]").forEach(element => {
-      element.removeAttribute("data-codex-readability-bubble");
-    });
-    document.querySelectorAll("#root, #root *").forEach(element => {
-      element.style.setProperty("color", "#ffffff", "important");
-      element.style.setProperty("caret-color", "#ffffff", "important");
-    });
+    clearMarks(markedBubbles, "data-codex-readability-bubble");
     markReadabilityBubble(document.querySelector("aside.app-shell-left-panel"), "sidebar");
     markReadabilityBubble(document.querySelector(".ProseMirror")?.closest('[class*="_ComposerLayoutRoot_"]'), "composer");
     markReadabilityBubble(document.querySelector("main > header"), "header");
     document.querySelectorAll('.thread-scroll-container [class*="group/user-message"] [class*="_bubble_"]').forEach(element => {
       markReadabilityBubble(element, "user");
     });
-    document.querySelectorAll("[data-markdown-text-style=assistant-message]").forEach(element => {
+    document.querySelectorAll(".thread-scroll-container [data-markdown-text-style=assistant-message]").forEach(element => {
       markReadabilityBubble(element.closest(".group.flex.min-w-0.flex-col"), "assistant");
     });
     document.querySelectorAll('.thread-scroll-container [class*="group/activity-header"]').forEach(element => {
@@ -162,9 +172,7 @@ const expression = `(() => {
   }
 
   function markReadabilitySurfaces() {
-    document.querySelectorAll("[data-codex-readability-surface]").forEach(element => {
-      element.removeAttribute("data-codex-readability-surface");
-    });
+    clearMarks(markedSurfaces, "data-codex-readability-surface");
     markReadabilitySurface(document.querySelector("aside.app-shell-left-panel"), "sidebar");
     markReadabilitySurface(document.querySelector('[class*="_ApplicationMenuTopBar_"]'), "topbar");
     markReadabilitySurface(document.querySelector("main"), "content");
@@ -202,28 +210,64 @@ const expression = `(() => {
       .join(",");
   }
 
+  /* Sampling a frame costs ~25ms and every changed custom property on :root
+     forces a full style recalculation (~95ms), so the old 500ms timer kept the
+     main thread busy even when the tint was not on screen. Sampling now runs
+     only in bubble mode, on a calmer 2s cadence, writes a property only when
+     its value really changed, and can never throw on every tick. */
+  const lastTintValues = new Map();
+  let bubbleTintTimer = null;
+
+  function tintSource() {
+    if (!media) return null;
+    if (media.tagName !== "VIDEO" && media.tagName !== "IMG") return null;
+    if (typeof media.readyState !== "number" || media.readyState < 2) return null;
+    return media;
+  }
+
+  function writeTint(name, value) {
+    if (lastTintValues.get(name) === value) return;
+    lastTintValues.set(name, value);
+    document.documentElement.style.setProperty(name, value);
+  }
+
   function updateBubbleTint() {
-    if (!media || media.readyState < 2) return;
-    const canvas = window.__codexBubbleTintCanvas ?? document.createElement("canvas");
-    canvas.width = 24;
-    canvas.height = 14;
-    window.__codexBubbleTintCanvas = canvas;
-    const context = canvas.getContext("2d", { willReadFrequently: true });
-    context.drawImage(media, 0, 0, canvas.width, canvas.height);
-    const { data } = context.getImageData(0, 0, canvas.width, canvas.height);
-    [0, 1, 2].forEach(zone => {
-      const start = zone * 8;
-      const end = start + 8;
-      const pixels = [];
-      for (let y = 0; y < canvas.height; y++) {
-        for (let x = start; x < end; x++) {
-          const offset = (y * canvas.width + x) * 4;
-          pixels.push(data[offset], data[offset + 1], data[offset + 2], data[offset + 3]);
+    const source = tintSource();
+    if (!source) return;
+    try {
+      const canvas = window.__codexBubbleTintCanvas ?? document.createElement("canvas");
+      canvas.width = 24;
+      canvas.height = 14;
+      window.__codexBubbleTintCanvas = canvas;
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+      context.drawImage(source, 0, 0, canvas.width, canvas.height);
+      const { data } = context.getImageData(0, 0, canvas.width, canvas.height);
+      [0, 1, 2].forEach(zone => {
+        const start = zone * 8;
+        const end = start + 8;
+        const pixels = [];
+        for (let y = 0; y < canvas.height; y++) {
+          for (let x = start; x < end; x++) {
+            const offset = (y * canvas.width + x) * 4;
+            pixels.push(data[offset], data[offset + 1], data[offset + 2], data[offset + 3]);
+          }
         }
-      }
-      document.documentElement.style.setProperty("--codex-bubble-tint-" + zone, pastelTint(pixels));
-      document.documentElement.style.setProperty("--codex-bubble-shade-" + zone, deepTint(pixels));
-    });
+        writeTint("--codex-bubble-tint-" + zone, pastelTint(pixels));
+        writeTint("--codex-bubble-shade-" + zone, deepTint(pixels));
+      });
+    } catch { /* one failed sample must not become an uncaught error every tick */ }
+  }
+
+  function syncBubbleTintTimer() {
+    const wanted = readabilityMode === "bubble" && !!tintSource();
+    if (wanted && bubbleTintTimer === null) {
+      updateBubbleTint();
+      bubbleTintTimer = setInterval(updateBubbleTint, 2000);
+    } else if (!wanted && bubbleTintTimer !== null) {
+      clearInterval(bubbleTintTimer);
+      bubbleTintTimer = null;
+    }
+    window.__codexBubbleTintTimer = bubbleTintTimer;
   }
 
   function applyReadability(value) {
@@ -283,6 +327,7 @@ const expression = `(() => {
       readabilityMode = button.dataset.mode;
       shadow.querySelectorAll(".modes button").forEach(item => item.classList.toggle("active", item === button));
       applyReadability(readabilityRange.value);
+      syncBubbleTintTimer();
     });
   });
   shadow.querySelectorAll(".presets button").forEach(button => {
@@ -315,17 +360,18 @@ const expression = `(() => {
   head.addEventListener("pointercancel", () => drag = null);
 
   document.body.append(host);
-  updateBubbleTint();
   clearInterval(window.__codexBubbleTintTimer);
-  window.__codexBubbleTintTimer = setInterval(updateBubbleTint, 500);
+  window.__codexBubbleTintTimer = null;
+  updateBubbleTint();
+  syncBubbleTintTimer();
   markReadabilityBubbles();
   markReadabilitySurfaces();
   if (window.__codexReadabilityObserver) window.__codexReadabilityObserver.disconnect();
   window.__codexReadabilityObserver = new MutationObserver(() => {
     clearTimeout(window.__codexReadabilityMarkTimer);
-    window.__codexReadabilityMarkTimer = setTimeout(markReadabilityBubbles, 80);
+    window.__codexReadabilityMarkTimer = setTimeout(markReadabilityBubbles, 250);
     clearTimeout(window.__codexReadabilitySurfaceTimer);
-    window.__codexReadabilitySurfaceTimer = setTimeout(markReadabilitySurfaces, 80);
+    window.__codexReadabilitySurfaceTimer = setTimeout(markReadabilitySurfaces, 250);
   });
   window.__codexReadabilityObserver.observe(document.body, { childList: true, subtree: true });
   apply(100);
