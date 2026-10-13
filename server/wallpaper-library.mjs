@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync, mkdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -191,11 +191,40 @@ export function extractSceneVideo(scenePath) {
   return result;
 }
 
+/* Only the current generation is kept: previous "<id>.<mtime>.<size>.mp4" files for
+   the same wallpaper are deleted once the fresh extraction is in place. */
+function dropStaleSceneVideoCache(cacheDir, stem, keepPath) {
+  try {
+    const keepName = path.basename(keepPath);
+    const legacyName = stem + ".mp4";
+    const prefix = stem + ".";
+    for (const name of readdirSync(cacheDir)) {
+      /* The pre-0.2.4 layout was a single "<id>.mp4"; the keyed name supersedes it,
+         so the legacy file is dead weight (tens of MB per wallpaper) and is swept. */
+      if (name === legacyName) { try { unlinkSync(path.join(cacheDir, name)); } catch {} continue; }
+      if (name === keepName || !name.startsWith(prefix) || !name.endsWith(".mp4")) continue;
+      const generation = name.slice(prefix.length, name.length - 4);
+      if (!/^[0-9]+[.][0-9]+$/.test(generation)) continue;
+      try { unlinkSync(path.join(cacheDir, name)); } catch {}
+    }
+  } catch {}
+}
+
 function extractSceneVideoUncached(scenePath) {
   const cacheDir = resolveCacheDir();
   if (!cacheDir) return null;
-  const cachePath = path.join(cacheDir, path.basename(path.dirname(scenePath)) + ".mp4");
-  if (existsSync(cachePath) && statSync(cachePath).size > 512 * 1024) return cachePath;
+  /* Key the cached extraction on the source package identity. Steam re-downloads and
+     workshop updates replace scene.pkg in place, and the old code happily reused the
+     previous extraction for the new package. */
+  let sourceStat;
+  try { sourceStat = statSync(scenePath); } catch { return null; }
+  if (sourceStat.size < 512 * 1024) return null;
+  const cacheStem = path.basename(path.dirname(scenePath));
+  const cachePath = path.join(cacheDir, `${cacheStem}.${Math.round(sourceStat.mtimeMs)}.${sourceStat.size}.mp4`);
+  if (existsSync(cachePath) && statSync(cachePath).size > 512 * 1024) {
+    dropStaleSceneVideoCache(cacheDir, cacheStem, cachePath);
+    return cachePath;
+  }
   const buffer = readFileSync(scenePath);
   const pkg = parsePkg(buffer);
   const candidates = [];
@@ -209,6 +238,7 @@ function extractSceneVideoUncached(scenePath) {
   candidates.sort((a, b) => b.length - a.length);
   if (!candidates.length || candidates[0].length < 512 * 1024) return null;
   try { writeFileSync(cachePath, candidates[0]); } catch { return null; }
+  dropStaleSceneVideoCache(cacheDir, cacheStem, cachePath);
   return cachePath;
 }
 

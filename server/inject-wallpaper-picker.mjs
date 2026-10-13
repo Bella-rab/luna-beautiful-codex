@@ -88,6 +88,12 @@ const expression = `(() => {
   const list = shadow.querySelector(".list");
   const status = shadow.querySelector(".status");
   let pointerDown = false;
+  let hoverId = "";
+  let hoverTimer = 0;
+  function clearHover(){ clearTimeout(hoverTimer); hoverTimer = 0; hoverId = ""; if (hostRoot.dataset.hover) hostRoot.dataset.hover = ""; }
+  /* Hover is the only reliable "about to click this row" signal; arm it after a
+     short dwell so sweeping across the list does not stage a scene. */
+  function armHover(id){ clearTimeout(hoverTimer); hoverTimer = setTimeout(() => { hoverId = id; hostRoot.dataset.hover = id; }, 120); }
   let lastSignature = null;
   function currentSource(){return document.getElementById("codex-custom-background-media")?.getAttribute("data-wallpaper-source")||""}
   function render(force){
@@ -101,12 +107,15 @@ const expression = `(() => {
     lastSignature = next;
     const scrollTop = list.scrollTop;
     const active = currentSource();
+    clearHover();
     list.innerHTML = "";
     for (const item of items) {
       const button = document.createElement("button");
       button.className = "item" + (item.id === active ? " active" : "");
       button.innerHTML = '<span class="id">' + item.id + '</span><span class="name">' + item.title.replace(/</g, "&lt;") + '</span><span class="quality">' + item.quality + '</span>';
-      button.onclick = () => { hostRoot.dataset.command = item.id; status.textContent = "正在切换：" + item.title; };
+      button.onpointerenter = () => armHover(item.id);
+      button.onpointerleave = () => { if (hoverId === item.id) clearHover(); };
+      button.onclick = () => { clearHover(); hostRoot.dataset.command = item.id; status.textContent = "正在切换：" + item.title; };
       list.append(button);
     }
     list.scrollTop = scrollTop;
@@ -117,6 +126,7 @@ const expression = `(() => {
        a leftover inline display on the panel outranks the stylesheet and made
        the 壁纸 button look dead. */
     panel.style.setProperty("display", open ? "block" : "none", "important");
+    if (!open) clearHover();
     if (open) render(true);
   }
   launcher.onclick = () => setOpen(!panel.classList.contains("open"));

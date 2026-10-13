@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
-import { listWallpapers as scanWallpapers, resolveWallpaperMedia } from "./wallpaper-library.mjs";
+import { listWallpapers as scanWallpapers, resolveWallpaperMedia, invalidateWallpaperCache } from "./wallpaper-library.mjs";
 
 const manifest = JSON.parse(readFileSync(path.join(import.meta.dirname, "..", ".codex-plugin", "plugin.json"), "utf8"));
 const pluginVersion = manifest.version;
@@ -336,7 +336,8 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        search: { type: "string", description: "Optional title or workshop ID substring" }
+        search: { type: "string", description: "Optional title or workshop ID substring" },
+        refresh: { type: "boolean", description: "Rescan the workshop libraries first, so wallpapers installed within the last 30s show up immediately." }
       }
     }
   },
@@ -434,7 +435,10 @@ async function toggleWhiteText(enabled) {
 
 async function callTool(name, args = {}) {
   switch (name) {
-    case "list_backgrounds": return { ok: true, wallpapers: filteredWallpapers(args.search) };
+    case "list_backgrounds": {
+      if (args.refresh) invalidateWallpaperCache();
+      return { ok: true, wallpapers: filteredWallpapers(args.search) };
+    }
     case "set_background": return installBackground(args);
     case "set_background_opacity": return setOpacity(args);
     case "reset_background": return resetBackground();

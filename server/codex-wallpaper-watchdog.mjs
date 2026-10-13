@@ -3,7 +3,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { listWallpapers, resolveWallpaperMedia } from "./wallpaper-library.mjs";
+import { listWallpapers, resolveWallpaperMedia, invalidateWallpaperCache } from "./wallpaper-library.mjs";
 
 const root = import.meta.dirname;
 const stateRoot = path.join(process.env.APPDATA || os.homedir(), "Codex", "luna-beautiful-codex");
@@ -23,6 +23,13 @@ const chunkSize = 512 * 1024;
    made large packages slow (126MB used to need ~273 chunked round trips) while
    leaving CSP untouched: the page still does no fetching of its own. */
 const FILE_INPUT_ID = "__luna_file";
+/* Prewarm gets its own hidden input. With a single shared input the scene the
+   prewarm handed to WebWallGL could be replaced under it by the *next* priming -
+   the library resolves the File lazily through fileSource(), so the mount parsed
+   whatever the input held at that moment and died with a corrupt package header
+   ("魔数长度异常: 536870912"), which then turned the first click into a full
+   re-install. Nothing outside the prewarm path touches this element. */
+const PREWARM_FILE_INPUT_ID = "__luna_prewarm_file";
 const VENDORED_WEBWALLGL_VERSION = "2.1.0";
 let libCapabilitiesLogged = false;
 const mediaCache = new Map();
@@ -37,9 +44,38 @@ const QUALITY_FPS_WINDOW_MS = 10000;
 const QUALITY_FPS_MIN_SAMPLES = 5;
 const QUALITY_HOLD_MIN_MS = 60000;
 const QUALITY_RESTORE_MAX_COOLDOWN_MS = 300000;
+/* Once a scene is downgraded again soon after a re-apply it is clear the tier
+   does not hold there; re-applying it every cycle is pure churn (40+ cycles were
+   observed on one scene), so the scene is settled for the rest of the session and
+   the per-cycle logging is muted after the first sighting. */
+const QUALITY_SETTLE_WINDOW_MS = 10000;
+const QUALITY_DEGRADE_LOG_EVERY = 10;
 const CONTEXT_REMOUNT_GRACE_MS = 6000;
 const CONTEXT_REMOUNT_COOLDOWN_MS = 20000;
 const CONTEXT_REMOUNT_MAX = 3;
+/* Hover prewarm: a picker row has to be hovered before it can be clicked, so the
+   scene is mounted into the hidden pending layer while the user aims and the click
+   only pays the cross-fade. The staged mount is not free - measured on this machine
+   it blocks the visible wallpaper for ~270ms at 1.6MB, ~300ms at 9.1MB and ~500ms
+   at 30MB (mount + the library's background bake) - so only scenes at or below this
+   budget prewarm. A heavier package would fight the visible wallpaper for the GPU
+   while the user is still browsing, and it also made a click on a *different* row
+   contend with the in-flight 30MB mount, so the click path already lands under 1s
+   for those without prewarming. */
+const PREWARM_MAX_BYTES = 16 * 1024 * 1024;
+const PREWARM_TICK_MS = 120;
+/* A prewarm that fails is not retried for a while: the failure is usually the
+   library refusing the scene, and retrying it on every tick only re-paid the
+   mount cost while the user was still browsing. */
+const PREWARM_FAIL_COOLDOWN_MS = 10000;
+/* Bound on how long a click may wait for an in-flight prewarm. Past this the
+   click installs normally, so a stuck prewarm can never make the click slower
+   than having no prewarm at all. */
+const PREWARM_CLICK_WAIT_MS = 600;
+/* How long a prewarm is expected to need. Older attempts are dropped on click
+   instead of waited for. */
+const PREWARM_READY_WINDOW_MS = 900;
+const IDLE_TICK_MS = 800;
 let lastContextRemount = 0;
 let contextRemounts = 0;
 let contextLostSeenAt = 0;
@@ -48,9 +84,25 @@ let lastQualityRestoreAt = 0;
 let qualityBackoff = QUALITY_RESTORE_COOLDOWN_MS;
 let qualityBackoffMountSeq = -1;
 let lastQuality = null;
+const qualitySceneStats = new Map();
+
+/* The watchdog appends to a single log file for the life of the install, so cap it:
+   past LOG_MAX_BYTES the live file is rotated to ".1" (replacing the previous
+   archive) and the byte counter resets. */
+const LOG_MAX_BYTES = 5 * 1024 * 1024;
+let logBytes = 0;
+try { logBytes = fs.statSync(logPath).size; } catch { logBytes = 0; }
 
 function log(message) {
-  try { fs.appendFileSync(logPath, `[${new Date().toISOString()}] ${message}\n`); } catch {}
+  const line = `[${new Date().toISOString()}] ${message}\n`;
+  try {
+    if (logBytes > LOG_MAX_BYTES) {
+      try { fs.renameSync(logPath, logPath + ".1"); } catch {}
+      logBytes = 0;
+    }
+    fs.appendFileSync(logPath, line);
+    logBytes += Buffer.byteLength(line);
+  } catch {}
 }
 
 function wait(milliseconds) {
@@ -60,6 +112,11 @@ function wait(milliseconds) {
 function readJson(filePath, fallback) {
   try { return JSON.parse(fs.readFileSync(filePath, "utf8")); } catch { return fallback; }
 }
+
+/* Surfaces the installed plugin build in /status. Lives beside the log helpers so
+   the manifest is read once at startup instead of on every request. */
+const pluginDir = path.dirname(root);
+const pluginVersion = readJson(path.join(pluginDir, ".codex-plugin", "plugin.json"), {}).version || null;
 
 function writeSelection(source, title) {
   memorySelection = { source, title };
@@ -138,7 +195,7 @@ async function acquireServer() {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify(prefs()));
         } else if (url.pathname === "/status") {
-          const payload = { selection: selection(), prefs: prefs(), pid: process.pid, deferredUpgrade: lastDeferredUpgrade, quality: lastQuality, contextRemounts };
+          const payload = { selection: selection(), prefs: prefs(), pid: process.pid, deferredUpgrade: lastDeferredUpgrade, quality: lastQuality, lastQualityEvent: lastQuality, qualitySettledForScene: [...qualitySceneStats].filter(([, v]) => v.settled).map(([id]) => id), contextRemounts, version: pluginVersion, pluginDir };
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify(payload));
         } else if (url.pathname.startsWith("/scene-fallback/")) {
@@ -159,8 +216,12 @@ async function acquireServer() {
           const sw = listWallpapers().find(item => item.id === sid);
           if (sw && sw.sceneDir) {
             const rel = parts.slice(2).join("/");
-            const safe = path.resolve(sw.sceneDir, rel || "scene.pkg");
-            if (safe.startsWith(sw.sceneDir) && fs.existsSync(safe) && fs.statSync(safe).isFile()) {
+            const sceneRoot = path.resolve(sw.sceneDir);
+            const safe = path.resolve(sceneRoot, rel || "scene.pkg");
+            /* Compare against the root plus a separator: a plain prefix test also
+               accepts sibling directories whose name merely starts with the scene
+               dir, so "../../431960-evil/x" would have escaped the root. */
+            if ((safe === sceneRoot || safe.startsWith(sceneRoot + path.sep)) && fs.existsSync(safe) && fs.statSync(safe).isFile()) {
               const ext = path.extname(safe).toLowerCase();
               const mime = { ".pkg": "application/octet-stream", ".tex": "application/octet-stream", ".json": "application/json", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".bin": "application/octet-stream", ".txt": "text/plain", ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg" }[ext] || "application/octet-stream";
               res.writeHead(200, { "content-type": mime }); fs.createReadStream(safe).pipe(res);
@@ -255,6 +316,15 @@ async function status() {
       stats: window.__webwallglInstance && window.__webwallglInstance.stats ? { fps: window.__webwallglInstance.stats.fps, running: window.__webwallglInstance.stats.running, idle: window.__webwallglInstance.stats.idle, occluded: window.__webwallglInstance.stats.occluded, throttled: window.__webwallglInstance.stats.throttled } : null,
       mountSeq: window.__codexMountSeq || 0,
       visibility: document.visibilityState,
+      pickerOpen: (() => {
+        const picker = document.getElementById("codex-wallpaper-picker");
+        const panel = picker && picker.shadowRoot ? picker.shadowRoot.querySelector(".panel") : null;
+        return !!(panel && panel.classList.contains("open"));
+      })(),
+      hoverCommand: (() => {
+        const picker = document.getElementById("codex-wallpaper-picker");
+        return (picker && picker.dataset.hover) || "";
+      })(),
       pickerCommand: (() => {
         const picker = document.getElementById("codex-wallpaper-picker");
         const command = picker?.dataset.command || "";
@@ -346,12 +416,12 @@ function evictPkgCache() {
    back to byte injection on any failure. DOM.requestNode answers 0 for this
    page, hence getDocument + querySelector; the node is re-resolved on every call
    because node ids go stale whenever the page reloads. */
-const FILE_INPUT_INIT = `(() => {
-  let input = document.getElementById(${JSON.stringify(FILE_INPUT_ID)});
+const fileInputInitExpression = inputId => `(() => {
+  let input = document.getElementById(${JSON.stringify(inputId)});
   if (!input || !input.isConnected) {
     input = document.createElement("input");
     input.type = "file";
-    input.id = ${JSON.stringify(FILE_INPUT_ID)};
+    input.id = ${JSON.stringify(inputId)};
     input.multiple = true;
     input.tabIndex = -1;
     input.setAttribute("aria-hidden", "true");
@@ -365,10 +435,11 @@ const FILE_INPUT_INIT = `(() => {
    cost four DevTools round trips (DOM.enable, DOM.getDocument, DOM.querySelector
    and a verify evaluate) on every single switch. Remember the id that worked and
    re-resolve only when it goes stale. */
-let fileInputNodeId = 0;
+const fileInputNodeIds = new Map();
 let domDomainEnabled = false;
 
-async function resolveFileInputNode(command) {
+async function resolveFileInputNode(command, inputId = FILE_INPUT_ID) {
+  const selector = "#" + inputId;
   if (!domDomainEnabled) {
     try { await command("DOM.enable", {}); domDomainEnabled = true; }
     catch { return 0; }
@@ -376,31 +447,31 @@ async function resolveFileInputNode(command) {
   let rootId = 0;
   try { const doc = await command("DOM.getDocument", { depth: 1 }); rootId = doc && doc.root ? doc.root.nodeId : 0; } catch { return 0; }
   if (!rootId) return 0;
-  try { const node = await command("DOM.querySelector", { nodeId: rootId, selector: "#" + FILE_INPUT_ID }); return node && node.nodeId ? node.nodeId : 0; } catch { return 0; }
+  try { const node = await command("DOM.querySelector", { nodeId: rootId, selector }); return node && node.nodeId ? node.nodeId : 0; } catch { return 0; }
 }
 
-async function primeFileInput(command, paths) {
+async function primeFileInput(command, paths, inputId = FILE_INPUT_ID) {
   const wanted = [...new Set((paths || []).filter(Boolean))];
   if (!wanted.length) return { ok: false, error: "no files to hand over" };
-  let nodeId = fileInputNodeId;
+  let nodeId = fileInputNodeIds.get(inputId) || 0;
   let failure = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     if (!nodeId) {
-      try { await command("Runtime.evaluate", { expression: FILE_INPUT_INIT, returnByValue: true }); }
+      try { await command("Runtime.evaluate", { expression: fileInputInitExpression(inputId), returnByValue: true }); }
       catch (error) { return { ok: false, error: "file input init failed: " + error.message }; }
-      nodeId = await resolveFileInputNode(command);
+      nodeId = await resolveFileInputNode(command, inputId);
       if (!nodeId) return { ok: false, error: "file input missing from the page" };
     }
     try { await command("DOM.setFileInputFiles", { files: wanted, nodeId }); failure = null; break; }
     catch (error) { failure = error; nodeId = 0; /* stale id (page reloaded): resolve again */ }
   }
   if (failure) return { ok: false, error: "DOM.setFileInputFiles failed: " + failure.message };
-  fileInputNodeId = nodeId;
+  fileInputNodeIds.set(inputId, nodeId);
   let seen = null;
-  try { seen = await command("Runtime.evaluate", { expression: `(() => { const input = document.getElementById(${JSON.stringify(FILE_INPUT_ID)}); return input && input.files ? Array.from(input.files).map(file => file.name + ":" + file.size) : null; })()`, returnByValue: true }); }
+  try { seen = await command("Runtime.evaluate", { expression: `(() => { const input = document.getElementById(${JSON.stringify(inputId)}); return input && input.files ? Array.from(input.files).map(file => file.name + ":" + file.size) : null; })()`, returnByValue: true }); }
   catch (error) { return { ok: false, error: "file input verify failed: " + error.message }; }
   if (!Array.isArray(seen) || seen.length !== wanted.length) {
-    fileInputNodeId = 0;
+    fileInputNodeIds.set(inputId, 0);
     return { ok: false, error: "file input holds " + (Array.isArray(seen) ? seen.length : "no") + " of " + wanted.length + " file(s)" };
   }
   return { ok: true, files: seen };
@@ -411,7 +482,7 @@ async function primeFileInput(command, paths) {
    page can give WebWallGL - or a <video>/<img> - the File itself and read the
    media straight off disk. No wallpaper bytes cross DevTools this way; ok=false
    means the caller should fall back to the byte stream. */
-async function primeWallpaperFiles(command, paths) {
+async function primeWallpaperFiles(command, paths, inputId = FILE_INPUT_ID) {
   const wanted = [];
   const seen = new Set();
   for (const candidate of paths || []) {
@@ -423,7 +494,7 @@ async function primeWallpaperFiles(command, paths) {
     wanted.push(candidate);
   }
   if (!wanted.length) return { ok: false, error: "no wallpaper files on disk" };
-  const primed = await primeFileInput(command, wanted);
+  const primed = await primeFileInput(command, wanted, inputId);
   if (!primed.ok) return primed;
   return { ok: true, paths: wanted, names: wanted.map(item => path.basename(item)), files: primed.files };
 }
@@ -450,7 +521,7 @@ const INGEST_HELPER = `window.__codexIngest = async (key, b64) => {
   });
   return chunk.length;
 }; 0`;
-async function installSceneWebGL(found, current) {
+async function installSceneWebGL(found, current, options = {}) {
   const port = lockPort;
   const wallpaperId = current.source;
   const installEpoch = selectEpoch;
@@ -478,8 +549,13 @@ async function installSceneWebGL(found, current) {
     let size = 0; try { size = fs.statSync(wallpaper.preview).size; } catch {}
     fallbackCandidates.push({ path: wallpaper.preview, mime: { ".gif": "image/gif", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp" }[ext] || "image/gif", size });
   }
-  fallbackCandidates.sort((a, b) => a.size - b.size);
-  const chosenFallback = fallbackCandidates.find(candidate => candidate.size > 0) || null;
+  /* Prefer the embedded scene video while it fits the budget: it is a far better
+     picture than the low-resolution preview image that is usually the smallest
+     candidate. Above the budget we fall back to the smallest candidate, and when
+     nothing fits we skip the pre-injection entirely. */
+  const videoFallback = fallbackCandidates.find(candidate => candidate.mime.startsWith("video/") && candidate.size > 0 && candidate.size <= FALLBACK_MAX_BYTES) || null;
+  const smallestFallback = fallbackCandidates.filter(candidate => candidate.size > 0).sort((a, b) => a.size - b.size)[0] || null;
+  const chosenFallback = videoFallback || (smallestFallback && smallestFallback.size <= FALLBACK_MAX_BYTES ? smallestFallback : null);
   let fallbackPath = null;
   let fallbackMime = "image/gif";
   let fallbackBytes = 0;
@@ -545,6 +621,63 @@ async function installSceneWebGL(found, current) {
   const phaseMs = { pre: 0 };
   const result = await withPage(found.target, async command => {
     const preStartedAt = Date.now();
+    if (options.cancelled && options.cancelled()) { log(`install aborted (superseded before priming): ${wallpaperId}`); return { ok: true, renderMode: "aborted", source: wallpaperId }; }
+    /* Commit path. The hover prewarm already handed the page the package, loaded
+       the library and mounted the scene into the pending layer, so the click only
+       has to swap the two layers and cross-fade. */
+    if (options.commit) {
+      phaseMs.pre = 0;
+      return await command("Runtime.evaluate", {
+        expression: `(() => {
+          const wallpaperId = ${JSON.stringify(wallpaperId)};
+          const expectedToken = ${JSON.stringify(options.prewarmToken || "")};
+          const pending = window.__codexPrewarm || null;
+          const base = document.getElementById("codex-custom-background-base-pending-hover");
+          if (!pending || pending.source !== wallpaperId || (expectedToken && pending.token !== expectedToken) || !base || !base.isConnected || !pending.instance || !pending.instance.canvas || !pending.instance.canvas.isConnected) {
+            return { ok: false, renderMode: "no-prewarm", reason: "prewarm missing or stale", source: wallpaperId };
+          }
+          const started = performance.now();
+          window.__codexPrewarm = null;
+          window.__codexPrewarmToken = null;
+          const previousInstance = window.__webwallglInstance;
+          const whenIdle = (fn, timeoutMs) => { const run = () => { try { fn(); } catch {} }; try { if (typeof window.requestIdleCallback === "function") { window.requestIdleCallback(run, { timeout: timeoutMs }); return; } } catch {} setTimeout(run, timeoutMs); };
+          const mediaEl = document.createElement("div");
+          mediaEl.setAttribute("data-wallpaper-source", wallpaperId);
+          mediaEl.setAttribute("data-render-mode", "webgl");
+          mediaEl.setAttribute("data-webgl-ready", "true");
+          mediaEl.setAttribute("data-background-opacity", "1");
+          mediaEl.setAttribute("data-surface-opacity", "0");
+          mediaEl.setAttribute("data-blur", "0");
+          mediaEl.style.cssText = "position:fixed!important;inset:0!important;z-index:0!important;pointer-events:none!important;opacity:1";
+          window.__webwallglInstance = pending.instance;
+          const oldLayers = Array.from(document.querySelectorAll("#codex-custom-background-base, #codex-custom-background-media"));
+          base.id = "codex-custom-background-base";
+          mediaEl.id = "codex-custom-background-media";
+          document.body.prepend(mediaEl);
+          document.body.prepend(base);
+          base.style.opacity = "1";
+          mediaEl.style.opacity = "1";
+          for (const el of oldLayers) {
+            if (!el || !el.isConnected) continue;
+            const deadCanvas = el.querySelector ? el.querySelector("canvas") : null;
+            el.style.transition = "opacity 260ms ease";
+            el.style.opacity = "0";
+            whenIdle(() => {
+              try {
+                if (deadCanvas) { const ctx = deadCanvas.getContext("webgl2") || deadCanvas.getContext("webgl"); const ext = ctx && ctx.getExtension ? ctx.getExtension("WEBGL_lose_context") : null; if (ext) ext.loseContext(); }
+                el.remove();
+              } catch {}
+            }, 700);
+          }
+          if (previousInstance && previousInstance !== pending.instance) {
+            whenIdle(() => { try { previousInstance.destroy && previousInstance.destroy(); } catch {} try { previousInstance.unmount && previousInstance.unmount(); } catch {} try { previousInstance.dispose && previousInstance.dispose(); } catch {} }, 1000);
+          }
+          return { ok: true, renderMode: "webgl", source: wallpaperId, via: "prewarm", pkgBytes: pending.pkgLen || 0, mountMs: 0, revealMs: Math.round(performance.now() - started), prewarmed: true };
+        })()`,
+        returnByValue: true,
+        awaitPromise: true
+      }, 20000);
+    }
 
     /* Hand the page the files themselves over the DOM domain: only paths cross
        the wire, and Chromium exposes each as a file-backed Blob the page reads
@@ -553,7 +686,7 @@ async function installSceneWebGL(found, current) {
     const wantedPaths = [];
     if (scenePath && sceneBytes > 0) wantedPaths.push(scenePath);
     if (fallbackPath && fallbackBytes > 0) wantedPaths.push(fallbackPath);
-    const primed = wantedPaths.length ? await primeWallpaperFiles(command, wantedPaths) : { ok: false, error: "no scene files on disk" };
+    const primed = wantedPaths.length ? await primeWallpaperFiles(command, wantedPaths, options.prewarm ? PREWARM_FILE_INPUT_ID : FILE_INPUT_ID) : { ok: false, error: "no scene files on disk" };
     const sceneIndex = primed.ok ? primed.paths.indexOf(scenePath) : -1;
     const fallbackIndex = primed.ok ? primed.paths.indexOf(fallbackPath) : -1;
     if (!primed.ok) log(`scene ${wallpaperId}: file channel unavailable (${primed.error}), streaming bytes`);
@@ -600,11 +733,17 @@ async function installSceneWebGL(found, current) {
 
 
     phaseMs.pre = Date.now() - preStartedAt;
-    if (selectEpoch !== installEpoch) { log(`install aborted (superseded): ${wallpaperId}`); return { ok: true, renderMode: "aborted", source: wallpaperId }; }
+    if (selectEpoch !== installEpoch || (options.cancelled && options.cancelled())) { log(`install aborted (superseded): ${wallpaperId}`); return { ok: true, renderMode: "aborted", source: wallpaperId }; }
     return await command("Runtime.evaluate", {
       expression: `(async () => {
         const wallpaperId = ${JSON.stringify(wallpaperId)};
         const libraryAvailable = ${JSON.stringify(!!libraryAvailable)};
+        const PREWARM_ONLY = ${JSON.stringify(options.prewarm === true)};
+        const PREWARM_TOKEN = ${JSON.stringify(options.prewarmToken || "")};
+        /* A prewarm stages into its own hidden input so no other install can
+           replace the File under the library lazy fileSource() read. */
+        const FILE_INPUT_ID = PREWARM_ONLY ? ${JSON.stringify(PREWARM_FILE_INPUT_ID)} : ${JSON.stringify(FILE_INPUT_ID)};
+        if (PREWARM_ONLY) { try { window.__codexPrewarmToken = PREWARM_TOKEN; } catch {} }
         const loseGl = (el) => { try { const ctx = el && el.getContext ? (el.getContext("webgl2") || el.getContext("webgl")) : null; if (ctx && ctx.getExtension) { const ext = ctx.getExtension("WEBGL_lose_context"); if (ext) ext.loseContext(); } } catch {} };
         const teardown = () => {
           if (window.__webwallglInstance) { try { if (window.__webwallglInstance.destroy) window.__webwallglInstance.destroy(); } catch {} try { if (window.__webwallglInstance.unmount) window.__webwallglInstance.unmount(); } catch {} try { if (window.__webwallglInstance.dispose) window.__webwallglInstance.dispose(); } catch {} window.__webwallglInstance = null; }
@@ -658,6 +797,11 @@ async function installSceneWebGL(found, current) {
            whole inject+mount window - and with a slow mount the blurry preview
            was the first thing the user saw. */
         const PENDING_BASE_ID = "codex-custom-background-base-pending";
+        /* The staged layer gets its own id so a click on a different row can start
+           an install immediately instead of waiting for this mount to finish. */
+        const PREWARM_BASE_ID = PENDING_BASE_ID + "-hover";
+        const prewarmBaseStyle = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important;opacity:0;display:block!important;visibility:visible!important;width:100vw!important;height:100vh!important";
+        const dropPrewarmLayer = () => { const el = document.getElementById(PREWARM_BASE_ID); if (el) { loseGl(el.querySelector("canvas")); el.remove(); } };
         const previousLayers = () => ["codex-custom-background-base", "codex-custom-background-media"].map(id => document.getElementById(id)).filter(Boolean);
         const dropPending = () => { const el = document.getElementById(PENDING_BASE_ID); if (el) { loseGl(el.querySelector("canvas")); el.remove(); } };
         const revealBackground = (baseEl, mediaEl, oldLayers) => {
@@ -678,7 +822,7 @@ async function installSceneWebGL(found, current) {
         const renderFallback = (reason, oldLayers) => {
           const data = window.__codexSceneFallback;
           const sceneInfo = window.__codexSceneFiles;
-          const fallbackInput = document.getElementById(${JSON.stringify(FILE_INPUT_ID)});
+          const fallbackInput = document.getElementById(FILE_INPUT_ID);
           const fallbackFile = fallbackInput && sceneInfo && sceneInfo.fallbackIndex >= 0 && fallbackInput.files ? fallbackInput.files[sceneInfo.fallbackIndex] : null;
           let objectUrl = null;
           let usedMime = "";
@@ -752,9 +896,13 @@ async function installSceneWebGL(found, current) {
           }
           try { window.__codexQualityRequested = { ...requestedQuality }; window.__codexMountSeq = (window.__codexMountSeq || 0) + 1; window.__codexContextLost = null; } catch {}
         };
+        /* A prewarm must never touch the visible wallpaper: when the scene cannot
+           be staged, report the failure instead of swapping a fallback on screen. */
+        const prewarmUnavailable = reason => ({ ok: false, renderMode: "prewarm-unavailable", reason, source: wallpaperId });
         const mountWebGL = async (oldLayers) => {
           dropPending();
           if (!libraryAvailable) {
+            if (PREWARM_ONLY) return prewarmUnavailable("WebWallGL library unavailable");
             return renderFallback(window.__webwallglLibError ? ("WebWallGL library error: " + window.__webwallglLibError) : "WebWallGL library not vendored (offline environment)", oldLayers);
           }
           if (window.__codexWebgl2Available === undefined) {
@@ -763,17 +911,19 @@ async function installSceneWebGL(found, current) {
             window.__codexWebgl2Available = !!probeCtx;
             try { probeCtx?.getExtension("WEBGL_lose_context")?.loseContext(); } catch {}
           }
-          if (!window.__codexWebgl2Available) return renderFallback("WebGL2 not available", oldLayers);
+          if (!window.__codexWebgl2Available) { if (PREWARM_ONLY) return prewarmUnavailable("WebGL2 not available"); return renderFallback("WebGL2 not available", oldLayers); }
           const previousInstance = window.__webwallglInstance;
           const base = document.createElement("div");
-          base.id = PENDING_BASE_ID;
+          base.id = PREWARM_ONLY ? PREWARM_BASE_ID : PENDING_BASE_ID;
+          if (PREWARM_ONLY) base.setAttribute("data-prewarm-token", PREWARM_TOKEN);
           base.setAttribute("data-wallpaper-source", wallpaperId);
-          base.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important;display:block!important;opacity:0";
+          base.style.cssText = PREWARM_ONLY ? prewarmBaseStyle : "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important;display:block!important;opacity:0";
+          if (PREWARM_ONLY) dropPrewarmLayer();
           document.body.prepend(base);
           const sceneInfo = window.__codexSceneFiles || null;
           const pkgData = window.__codexScenePkg;
           const pkgProject = (sceneInfo && sceneInfo.project) || (pkgData && pkgData.project) || null;
-          const fileInput = document.getElementById(${JSON.stringify(FILE_INPUT_ID)});
+          const fileInput = document.getElementById(FILE_INPUT_ID);
           const sceneFile = fileInput && sceneInfo && sceneInfo.sceneIndex >= 0 && fileInput.files ? fileInput.files[sceneInfo.sceneIndex] : null;
           const { mount, bytesSource, fileSource } = window.WebWallGL;
           /* Three tiers, cheapest first: let WebWallGL read the pkg off disk; else
@@ -822,9 +972,10 @@ async function installSceneWebGL(found, current) {
               try { if (mountErr && mountErr.instance && mountErr.instance.destroy) mountErr.instance.destroy(); } catch {}
               dropPending();
               const nb = document.createElement("div");
-              nb.id = PENDING_BASE_ID;
+              nb.id = PREWARM_ONLY ? PREWARM_BASE_ID : PENDING_BASE_ID;
+              if (PREWARM_ONLY) nb.setAttribute("data-prewarm-token", PREWARM_TOKEN);
               nb.setAttribute("data-wallpaper-source", wallpaperId);
-              nb.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important;display:block!important;opacity:0";
+              nb.style.cssText = PREWARM_ONLY ? prewarmBaseStyle : "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important;display:block!important;opacity:0";
               document.body.prepend(nb);
               pushDiag("info", "retrying mount with mountTimeoutMs=0 (first-frame timeout recovery)");
               try { inst = await mount(nb, mountOptions({ mountTimeoutMs: 0 })); retried = true; }
@@ -832,6 +983,25 @@ async function installSceneWebGL(found, current) {
             } else { throw mountErr; }
           }
           if (!inst) throw new Error("WebWallGL mount returned no instance");
+          if (PREWARM_ONLY) {
+            /* Superseded while the mount was running: the drop already invalidated
+               this token, so throw the fresh instance and its layer away rather
+               than leaving a second live scene behind. */
+            if (window.__codexPrewarmToken !== PREWARM_TOKEN) {
+              try { inst.destroy && inst.destroy(); } catch {}
+              try { inst.unmount && inst.unmount(); } catch {}
+              try { inst.dispose && inst.dispose(); } catch {}
+              dropPrewarmLayer();
+              return { ok: true, renderMode: "aborted", source: wallpaperId };
+            }
+            /* Park the mounted instance in the staged layer and leave the live
+               wallpaper, its style sheet and the GL guard untouched. */
+            const parked = document.getElementById(PREWARM_BASE_ID);
+            if (parked) { try { const cv = parked.querySelector("canvas"); if (cv) { cv.style.display = "block"; cv.style.visibility = "visible"; cv.style.width = "100vw"; cv.style.height = "100vh"; } } catch {} }
+            window.__codexPrewarm = { source: wallpaperId, token: PREWARM_TOKEN, baseId: PREWARM_BASE_ID, instance: inst, quality, pkgLen, at: Date.now() };
+            installGlGuard(quality);
+            return { ok: true, renderMode: "webgl", prewarmed: true, source: wallpaperId, via, pkgBytes: pkgLen, mountMs: Math.round(performance.now() - mountStarted), lastDiag: lastDiag(), diagCount: diagCount() };
+          }
           window.__webwallglInstance = inst;
           const mediaEl = document.createElement("div");
           mediaEl.setAttribute("data-wallpaper-source", wallpaperId);
@@ -841,7 +1011,7 @@ async function installSceneWebGL(found, current) {
           mediaEl.setAttribute("data-surface-opacity", "0");
           mediaEl.setAttribute("data-blur", "0");
           mediaEl.style.cssText = "position:fixed!important;inset:0!important;z-index:0!important;pointer-events:none!important;opacity:1";
-          revealBackground(document.getElementById(PENDING_BASE_ID) || base, mediaEl, oldLayers);
+          revealBackground(document.getElementById(PREWARM_ONLY ? PREWARM_BASE_ID : PENDING_BASE_ID) || base, mediaEl, oldLayers);
           if (previousInstance && previousInstance !== inst) {
             whenIdle(() => { try { previousInstance.destroy && previousInstance.destroy(); } catch {} try { previousInstance.unmount && previousInstance.unmount(); } catch {} try { previousInstance.dispose && previousInstance.dispose(); } catch {} }, 1000);
           }
@@ -855,7 +1025,7 @@ async function installSceneWebGL(found, current) {
            fallback right away and upgrade to WebGL the moment the page
            becomes visible again. */
         const oldLayers = previousLayers();
-        const fallbackReady = (() => { const info = window.__codexSceneFiles; const input = document.getElementById(${JSON.stringify(FILE_INPUT_ID)}); if (info && info.fallbackIndex >= 0 && input && input.files && input.files[info.fallbackIndex]) return true; return !!(window.__codexSceneFallback && window.__codexSceneFallback.bytes && window.__codexSceneFallback.bytes.length); })();
+        const fallbackReady = (() => { const info = window.__codexSceneFiles; const input = document.getElementById(FILE_INPUT_ID); if (info && info.fallbackIndex >= 0 && input && input.files && input.files[info.fallbackIndex]) return true; return !!(window.__codexSceneFallback && window.__codexSceneFallback.bytes && window.__codexSceneFallback.bytes.length); })();
         if (document.visibilityState === "hidden" && fallbackReady) {
           const deferred = renderFallback("window hidden - WebGL mount deferred until the page is visible", oldLayers);
           if (deferred && deferred.ok) {
@@ -871,14 +1041,18 @@ async function installSceneWebGL(found, current) {
         try {
           return await mountWebGL(oldLayers);
         } catch (err) {
+          if (PREWARM_ONLY) { dropPending(); return prewarmUnavailable(String(err && err.message || err).slice(0, 160)); }
           return renderFallback(err, oldLayers);
         }
       })()`,
       returnByValue: true,
       awaitPromise: true
-    }, 120000);
+    }, options.prewarm ? 20000 : 120000);
   });
-  if (result && result.renderMode === "webgl") {
+  if (result && typeof result === "object") result.preMs = phaseMs.pre;
+  if (result && result.renderMode === "webgl" && result.prewarmed && result.via !== "prewarm") {
+    log(`scene prewarm ${wallpaperId}: staged into the pending layer (via=${result.via} pkgBytes=${result.pkgBytes} mountMs=${result.mountMs} preMs=${result.preMs})`);
+  } else if (result && result.renderMode === "webgl" && result.via !== "prewarm") {
     log(`scene webgl ${wallpaperId}: renderMode=webgl (vendored WebWallGL, via=${result.via} pkgBytes=${result.pkgBytes} mountMs=${result.mountMs} preMs=${phaseMs.pre}${result.mountRetried ? " retried=true" : ""}${result.lastDiag ? " lastDiag=" + String(result.lastDiag).slice(0, 160) : ""}${result.diagCount ? " diagCount=" + result.diagCount : ""})`);
   } else if (result) {
     log(`scene webgl ${wallpaperId}: renderMode=${result.renderMode}${result.via ? " via=" + result.via : ""}${result.deferredWebGL ? " deferredWebGL=true" : ""}${result.webglError ? " webglError=" + String(result.webglError).slice(0, 180) : ""}${result.fallbackError ? " fallbackError=" + result.fallbackError : ""}${result.fallbackBytes ? " fallbackBytes=" + result.fallbackBytes + " mime=" + result.fallbackMime : ""}${result.error ? " error=" + result.error : ""}${result.lastDiag ? " lastDiag=" + String(result.lastDiag).slice(0, 160) : ""}${result.diagCount ? " diagCount=" + result.diagCount : ""}`);
@@ -1032,9 +1206,34 @@ async function pageEval(expression, timeoutMs = 20000) {
   if (!found) return null;
   return await withPage(found.target, command => command("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, timeoutMs));
 }
-async function attemptQualityRestore(current, effective, fps) {
+/* Per-scene downgrade bookkeeping. A transition into the downgraded state is one
+   event. Two events inside the settle window count as a loop, and so does a
+   downgrade that lands after one of our re-applies - that is the library
+   rejecting the tier we just pushed back on, and two rejections in a session
+   mean the scene simply cannot hold it (the observed scene looped 40+ times).
+   The rejection counter is deliberately not time-bounded: the library waits out
+   the re-apply before dropping again, so a 10s window alone rarely catches it. */
+function trackQualityScene(id, downgraded, now) {
+  let scene = qualitySceneStats.get(id);
+  if (!scene) { scene = { lastDowngraded: false, recent: [], transitions: 0, restores: 0, rejections: 0, cycles: 0, settled: false, settledAt: 0 }; qualitySceneStats.set(id, scene); }
+  if (downgraded && !scene.lastDowngraded) {
+    scene.transitions += 1;
+    scene.recent.push(now);
+    while (scene.recent.length && now - scene.recent[0] > QUALITY_SETTLE_WINDOW_MS) scene.recent.shift();
+    if (scene.restores > scene.rejections) scene.rejections += 1;
+    if (!scene.settled && (scene.recent.length >= 2 || scene.rejections >= 2)) {
+      scene.settled = true;
+      scene.settledAt = now;
+      log(`quality settled for ${id}: ${scene.transitions} downgrade(s) this session (${scene.recent.length} within ${QUALITY_SETTLE_WINDOW_MS}ms, ${scene.rejections} after a re-apply); leaving the library tier as-is`);
+    }
+  }
+  scene.lastDowngraded = downgraded;
+  return scene;
+}
+async function attemptQualityRestore(current, effective, fps, scene) {
   const heldMs = qualityFpsWindow.length > 1 ? Math.round(Date.now() - qualityFpsWindow[0].t) : 0;
-  log(`quality degraded on ${current.source}: postProcessing=${effective && effective.postProcessing} (aa=${effective && effective.antiAliasing} particles=${effective && effective.particles}); re-applying the requested tier after ${heldMs}ms at ${fps.toFixed(1)}fps`);
+  const loud = !scene || scene.cycles === 1 || scene.cycles % QUALITY_DEGRADE_LOG_EVERY === 0;
+  if (loud) log(`quality degraded on ${current.source}: postProcessing=${effective && effective.postProcessing} (aa=${effective && effective.antiAliasing} particles=${effective && effective.particles}); re-applying the requested tier after ${heldMs}ms at ${fps.toFixed(1)}fps`);
   const result = await pageEval(`(() => {
     const instance = window.__webwallglInstance;
     if (!instance || typeof instance.setQuality !== "function") return { outcome: "no-instance" };
@@ -1046,7 +1245,7 @@ async function attemptQualityRestore(current, effective, fps) {
     const restored = !!after && Object.keys(requested).every(key => after[key] === requested[key]);
     return { outcome: restored ? "restored" : "not-restored", before, after };
   })()`);
-  log(`quality re-apply ${JSON.stringify(result)}: ${current.source}`);
+  if (loud) log(`quality re-apply ${JSON.stringify(result)}: ${current.source}`);
   return result;
 }
 let restoring = false;
@@ -1055,9 +1254,9 @@ let selectEpoch = 0;
    landed; 800ms keeps the loop cheap and /select now wakes it instantly. */
 let ticker = null;
 function wakeTicker() { if (ticker) ticker(); }
-function nextTick() {
+function nextTick(delayMs = IDLE_TICK_MS) {
   return new Promise(resolve => {
-    const timer = setTimeout(() => { ticker = null; resolve(); }, 800);
+    const timer = setTimeout(() => { ticker = null; resolve(); }, delayMs);
     ticker = () => { clearTimeout(timer); ticker = null; resolve(); };
   });
 }
@@ -1084,14 +1283,130 @@ try {
 }
 log(`watchdog started pid=${process.pid}`);
 let lastWhite = null;
-for (;;) {
+let lastPickerOpen = false;
+let prewarm = null;
+let prewarmEpoch = 0;
+let prewarmBusy = false;
+let prewarmFlight = null;
+const prewarmSizes = new Map();
+const prewarmFailedAt = new Map();
+
+/* Cheapest gate first: only a WebGL scene whose package is small enough to stage
+   without fighting the visible wallpaper for the GPU can prewarm. */
+function prewarmInfo(id) {
+  if (!id || !/^\d+$/.test(id)) return null;
+  const now = Date.now();
+  if (now - (prewarmFailedAt.get(id) || 0) < PREWARM_FAIL_COOLDOWN_MS) return null;
+  const memo = prewarmSizes.get(id);
+  if (memo && now - memo.at < 20000) return memo.info;
+  let info = null;
   try {
-    const current = selection();
+    const wallpaper = listWallpapers().find(item => item.id === id) || null;
+    if (wallpaper && wallpaper.scene && mediaMeta(id).renderMode === "webgl") {
+      const size = fs.statSync(wallpaper.scene).size;
+      if (size > 0 && size <= PREWARM_MAX_BYTES) info = { scene: wallpaper.scene, size };
+    }
+  } catch { info = null; }
+  prewarmSizes.set(id, { at: now, info });
+  return info;
+}
+
+/* Release a staged scene: destroy the instance, drop its GL context and take the
+   pending layer out of the DOM. The token check keeps a late drop from touching a
+   newer prewarm or an install that already replaced the pending layer. */
+function prewarmDropExpression(token) {
+  return `(() => {
+    if (window.__codexPrewarmToken !== ${JSON.stringify(token)}) return { ok: false, reason: "superseded" };
+    window.__codexPrewarmToken = null;
+    const pending = window.__codexPrewarm || null;
+    window.__codexPrewarm = null;
+    try {
+      if (pending && pending.instance) {
+        const inst = pending.instance;
+        try { inst.destroy && inst.destroy(); } catch {}
+        try { inst.unmount && inst.unmount(); } catch {}
+        try { inst.dispose && inst.dispose(); } catch {}
+      }
+    } catch {}
+    const el = document.getElementById("codex-custom-background-base-pending-hover");
+    if (el) {
+      try {
+        const canvas = el.querySelector("canvas");
+        const ctx = canvas && canvas.getContext ? (canvas.getContext("webgl2") || canvas.getContext("webgl")) : null;
+        const ext = ctx && ctx.getExtension ? ctx.getExtension("WEBGL_lose_context") : null;
+        if (ext) ext.loseContext();
+      } catch {}
+      try { el.remove(); } catch {}
+    }
+    return { ok: true };
+  })()`;
+}
+
+function dropPrewarm(reason, target = prewarm) {
+  if (!target) return;
+  if (prewarm === target) prewarm = null;
+  prewarmEpoch++;
+  pageEval(prewarmDropExpression(target.token), 8000).catch(() => {});
+  log(`prewarm dropped (${reason}): ${target.id}`);
+}
+
+function startPrewarm(id, info) {
+  const token = id + "-" + Math.random().toString(36).slice(2, 10);
+  const entry = { id, token, epoch: ++prewarmEpoch, status: "running", startedAt: Date.now(), result: null, promise: null, size: info.size };
+  prewarm = entry;
+  prewarmBusy = true;
+  log(`prewarm start ${id} (${(info.size / 1048576).toFixed(1)}MB)`);
+  const flight = (async () => {
+    try {
+      const found = await findPage();
+      if (!found) throw new Error("Codex main page disappeared");
+      const result = await installSceneWebGL(found, { source: id }, { prewarm: true, prewarmToken: token, cancelled: () => prewarm !== entry || entry.token !== token });
+      if (prewarm !== entry) return;
+      if (result && result.prewarmed) { entry.status = "ready"; entry.result = result; prewarmFailedAt.delete(id); log(`prewarm ready ${id} (mountMs=${result.mountMs} via=${result.via} pkgBytes=${result.pkgBytes})`); }
+      else { entry.status = "failed"; prewarmFailedAt.set(id, Date.now()); entry.result = result; log(`prewarm failed ${id}: ${JSON.stringify(result).slice(0, 200)}`); }
+    } catch (error) {
+
+      entry.status = "failed";
+      prewarmFailedAt.set(id, Date.now());
+      log(`prewarm error ${id}: ${error.message}`);
+      if (prewarm === entry) { prewarm = null; prewarmEpoch++; pageEval(prewarmDropExpression(token), 8000).catch(() => {}); }
+    }
+  })();
+  entry.promise = flight;
+  prewarmFlight = flight;
+  flight.then(() => { if (prewarmFlight === flight) { prewarmBusy = false; prewarmFlight = null; } });
+  return entry;
+}
+
+async function commitPrewarmSelection(current, staged) {
+  try {
+    const found = await findPage();
+    if (!found) { log(`prewarm commit skipped for ${current.source}: page missing`); return false; }
+    const committed = await installSceneWebGL(found, current, { commit: true, prewarmToken: staged.token });
+    if (committed && committed.ok) { log(`background installed: ${current.source} (revealed from prewarm, revealMs=${committed.revealMs})`); return true; }
+    log(`prewarm commit unavailable for ${current.source}: ${committed ? committed.reason : "no result"}`);
+    return false;
+  } catch (error) { log(`prewarm commit failed for ${current.source}: ${error.message}`); return false; }
+}
+for (;;) {
+  let tickDelay = IDLE_TICK_MS;
+  try {
+    let current = selection();
     const preference = prefs();
     const state = await status();
+    if (state && state.page) tickDelay = state.pickerOpen ? PREWARM_TICK_MS : IDLE_TICK_MS;
+    let pickerPicked = "";
     if (state.page && state.pickerCommand && /^\d+$/.test(state.pickerCommand)) {
       const wallpaper = listWallpapers().find(item => item.id === state.pickerCommand);
-      if (wallpaper) { writeSelection(wallpaper.id, wallpaper.title); mediaCache.delete(wallpaper.id); log(`picker selected ${wallpaper.id}`); }
+      if (wallpaper) { writeSelection(wallpaper.id, wallpaper.title); mediaCache.delete(wallpaper.id); log(`picker selected ${wallpaper.id}`); pickerPicked = wallpaper.id; }
+      /* The selection was read before the command was handled, so re-read it:
+         otherwise this tick still compares against the old wallpaper and the
+         install only starts on the next full tick - the invisible 800ms wait. */
+      current = selection();
+    }
+    if (state.page && !!state.pickerOpen !== lastPickerOpen) {
+      lastPickerOpen = !!state.pickerOpen;
+      if (lastPickerOpen) { invalidateWallpaperCache(); mediaCache.clear(); prewarmSizes.clear(); log("picker opened: wallpaper library cache invalidated"); }
     }
     if (state.page && preference.whiteText && !state.whiteText && lastWhite !== true) { await applyWhiteText(); lastWhite = true; }
     else if (state.page && !preference.whiteText && state.whiteText && lastWhite !== false) { await removeWhiteText(); lastWhite = false; }
@@ -1139,7 +1454,8 @@ for (;;) {
       const stats = state.stats || null;
       const fps = stats && Number.isFinite(stats.fps) ? stats.fps : null;
       const busy = !stats || stats.occluded === true || stats.running === false;
-      lastQuality = { requested: state.qualityRequested, effective: state.quality, downgraded, fps: fps === null ? null : Math.round(fps * 10) / 10, sceneFps: QUALITY_SCENE_FPS, mountSeq: state.mountSeq, secondsSinceRestore: lastQualityRestoreAt ? Math.round((Date.now() - lastQualityRestoreAt) / 1000) : null };
+      const qualityScene = trackQualityScene(current.source, downgraded, Date.now());
+      lastQuality = { requested: state.qualityRequested, effective: state.quality, downgraded, fps: fps === null ? null : Math.round(fps * 10) / 10, sceneFps: QUALITY_SCENE_FPS, mountSeq: state.mountSeq, secondsSinceRestore: lastQualityRestoreAt ? Math.round((Date.now() - lastQualityRestoreAt) / 1000) : null, settledForScene: !!qualityScene.settled, sceneDegrades: qualityScene.transitions };
       if (!downgraded || busy || fps === null || state.visibility !== "visible") {
         qualityFpsWindow.length = 0;
       } else {
@@ -1150,7 +1466,7 @@ for (;;) {
         const heldMs = qualityFpsWindow.length > 1 ? now - qualityFpsWindow[0].t : 0;
         lastQuality.avgFps = Math.round(avgFps * 10) / 10;
         lastQuality.samples = qualityFpsWindow.length;
-        if (!restoring && heldMs >= QUALITY_RESTORE_HOLD_MS && qualityFpsWindow.length >= QUALITY_FPS_MIN_SAMPLES && avgFps >= QUALITY_SCENE_FPS * QUALITY_RESTORE_RATIO && now - lastQualityRestoreAt >= qualityBackoff) {
+        if (!restoring && !qualityScene.settled && heldMs >= QUALITY_RESTORE_HOLD_MS && qualityFpsWindow.length >= QUALITY_FPS_MIN_SAMPLES && avgFps >= QUALITY_SCENE_FPS * QUALITY_RESTORE_RATIO && now - lastQualityRestoreAt >= qualityBackoff) {
           /* Thrash guard: a scene sitting right on the frame cap will be
              downgraded again immediately after the tier goes back on. Every
              re-apply that did not hold for a minute doubles the wait, so a
@@ -1160,7 +1476,9 @@ for (;;) {
           qualityBackoff = sinceLast < QUALITY_HOLD_MIN_MS ? Math.min(qualityBackoff * 2, QUALITY_RESTORE_MAX_COOLDOWN_MS) : QUALITY_RESTORE_COOLDOWN_MS;
           lastQualityRestoreAt = now;
           lastQuality.cooldownMs = qualityBackoff;
-          try { lastQuality.reapplied = await attemptQualityRestore(current, state.quality, avgFps); } catch (error) { log(`quality re-apply failed: ${error.message}`); }
+          qualityScene.cycles += 1;
+          qualityScene.restores += 1;
+          try { lastQuality.reapplied = await attemptQualityRestore(current, state.quality, avgFps, qualityScene); } catch (error) { log(`quality re-apply failed: ${error.message}`); }
           qualityFpsWindow.length = 0;
         }
       }
@@ -1172,7 +1490,39 @@ for (;;) {
       lastQuality = null;
     }
 
-    const needsBackground = state.page && (contextRecovery || !state.background || !state.base || state.source !== current.source);
+    /* ---- hover prewarm ----
+       A row has to be hovered before it can be clicked, so the mount is staged in
+       the hidden pending layer while the user aims; the click then only pays the
+       cross-fade. Anything that changes the intent (another row, the panel
+       closing, a different wallpaper being picked) drops the staged scene and
+       releases its GL context. */
+    let prewarmCommitted = false;
+    const staged = prewarm;
+    const hoverId = state.page && state.pickerOpen && /^\d+$/.test(state.hoverCommand || "") ? state.hoverCommand : "";
+    const wantPrewarm = !pickerPicked && state.page && state.pickerOpen && state.visibility === "visible" && hoverId && hoverId !== current.source && prewarmInfo(hoverId) ? hoverId : "";
+    if (pickerPicked && staged && staged.id === pickerPicked) {
+      /* A prewarm must never make the click slower than having none: only a
+         fresh stage is waited for, only for a bounded window, and anything
+         failed or stale is dropped so the install starts on this same tick. */
+      const stagedAge = Date.now() - staged.startedAt;
+      if (staged.status === "running" && stagedAge <= PREWARM_READY_WINDOW_MS) { try { await Promise.race([staged.promise, wait(PREWARM_CLICK_WAIT_MS)]); } catch {} }
+      if (staged.status === "ready") {
+        prewarmCommitted = await commitPrewarmSelection(current, staged);
+        if (prewarmCommitted) { prewarm = null; prewarmEpoch++; }
+        else dropPrewarm("commit failed", staged);
+      } else {
+        log(`prewarm for ${pickerPicked} not usable (status=${staged.status}, ageMs=${stagedAge}); installing normally`);
+        dropPrewarm("not ready", staged);
+      }
+    } else if (staged && staged.id !== wantPrewarm) {
+      dropPrewarm(wantPrewarm ? "hover moved to another wallpaper" : "hover left or the panel closed", staged);
+    }
+    if (wantPrewarm && !prewarm && !prewarmBusy && !restoring && !pickerPicked) {
+      const info = prewarmInfo(wantPrewarm);
+      if (info) startPrewarm(wantPrewarm, info);
+    }
+
+    const needsBackground = state.page && !prewarmCommitted && (contextRecovery || !state.background || !state.base || state.source !== current.source);
     const needsControls = state.page && (!state.readability || !state.controls);
     const needsPicker = state.page && !state.picker;
     if (!restoring && (needsBackground || (needsControls && !controlsRunning) || (needsPicker && !pickerRunning))) {
@@ -1186,5 +1536,5 @@ for (;;) {
       finally { clearTimeout(installSafety); restoring = false; }
     }
   } catch (error) { log(`error: ${error.message}`); }
-  await nextTick();
+  await nextTick(tickDelay);
 }
