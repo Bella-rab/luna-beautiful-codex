@@ -443,7 +443,7 @@ export function readAppearancePrefs(env = process.env) {
    page latched on window.__lunaAppearance and re-injects on a mismatch, which is what
    makes a watchdog restart after a code update take effect on a page that is already
    running an older runtime (the panel node alone cannot tell the two apart). */
-export const APPEARANCE_BUILD = "phase3+2026.10.18.1";
+export const APPEARANCE_BUILD = "phase4+2026.10.18.1";
 const BUILD_TOKEN = "__LUNA_APPEARANCE_BUILD__";
 
 /* The page-side half. It is serialised with Function.prototype.toString() and evaluated
@@ -939,6 +939,27 @@ function pageRuntime() {
     parent.append(wrap);
     return wrap;
   };
+  /* Phase 4: the panel now has well over a hundred controls. Building every
+     section up front cost ~100ms on open, so only the default-open group is
+     built eagerly and the rest are created on their first expand. Any section
+     that is built later runs the syncers once so it reflects the live state. */
+  const lazySection = (parent, title, open, build) => {
+    const wrap = el("details");
+    wrap.append(el("summary", null, title));
+    const holder = el("div", "sectionBody");
+    wrap.append(holder);
+    let built = false;
+    const run = () => {
+      if (built) return;
+      built = true;
+      try { build(holder); } catch (error) { try { log("error", "panel section failed: " + (error && error.message)); } catch {} }
+      syncersRun();
+    };
+    wrap.addEventListener("toggle", () => { if (wrap.open) run(); });
+    parent.append(wrap);
+    if (open) { wrap.open = true; run(); }
+    return wrap;
+  };
   const syncersRun = () => {
     for (const run of syncers.concat(subSyncers)) { try { run(); } catch {} }
   };
@@ -1108,8 +1129,7 @@ function pageRuntime() {
     return result;
   };
 
-  const renderPresets = body => {
-    const wrap = section(body, "预设", false);
+  const renderPresets = body => lazySection(body, "预设", false, wrap => {
     const list = el("div", "presets");
     /* Two-step confirm instead of window.confirm(): a blocking dialog on an unfocused
        window would freeze the page the watchdog is driving. */
@@ -1238,9 +1258,8 @@ function pageRuntime() {
       debouncedSave();
       say("已保存预设：" + name);
     });
-  };
-  const renderGlass = body => {
-    const wrap = section(body, "液态玻璃", true);
+  });
+  const renderGlass = body => lazySection(body, "液态玻璃", true, wrap => {
     const head = el("div", "grid2");
     wrap.append(head);
     toggleRow(head, "glass.enabled", "启用玻璃");
@@ -1334,9 +1353,8 @@ function pageRuntime() {
       const used = extraSelectors(area.value);
       extraOut.textContent = used.length + " / " + MAX_EXTRA_SELECTORS;
     });
-  };
-  const renderFonts = body => {
-    const wrap = section(body, "字体与配色", false);
+  });
+  const renderFonts = body => lazySection(body, "字体与配色", false, wrap => {
     textRow(wrap, "fonts.globalFamily", "全局字体族（应用到 #root）", "\"LXGW WenKai\", sans-serif");
     const systemRow = el("div", "row");
     const system = el("button", "toggle", "使用系统字体（queryLocalFonts）");
@@ -1441,9 +1459,8 @@ function pageRuntime() {
       wrap.append(pair.input.closest(".row"));
     }
     wrap.append(el("div", "hint", "UI 配色留空即不改动；发送按钮/文件图标这类目标是按当前 DOM 推断的选择器，若 Codex 改版可能失配（只会不生效，不会报错）。"));
-  };
-  const renderFilters = body => {
-    const wrap = section(body, "画面滤镜与取景", false);
+  });
+  const renderFilters = body => lazySection(body, "画面滤镜与取景", false, wrap => {
     rangeRow(wrap, "filters.blur", "背景模糊", 0, 20, 1, "px");
     rangeRow(wrap, "filters.brightness", "亮度", 0, 200, 1, "%");
     rangeRow(wrap, "filters.contrast", "对比度", 0, 200, 1, "%");
@@ -1455,7 +1472,7 @@ function pageRuntime() {
     rangeRow(wrap, "filters.positionY", "垂直位置", 0, 100, 1, "%");
     rangeRow(wrap, "filters.scale", "缩放", 100, 200, 1, "%");
     wrap.append(el("div", "hint", "滤镜走 CSS filter（GPU 合成），取景对原生视频用 object-fit/object-position、对 WebGL 画布用 transform；新旧背景层会带上同一套参数，切换时不会跳变。"));
-  };
+  });
   /* ---------- Phase 3: 扩展特效 ---------- */
   const EXT_FORM_LABELS = { whale: "鲸鱼", cat: "猫", rabbit: "兔", fox: "狐狸", penguin: "企鹅", robot: "机器人" };
   const CLICK_LABELS = { ripple: "涟漪", spark: "火花", ring: "圆环" };
@@ -1504,8 +1521,7 @@ function pageRuntime() {
     return { input, clear };
   };
 
-  const renderExt = body => {
-    const wrap = section(body, "扩展特效（点击 / 拖尾 / 视差 / 头像 / 吉祥物）", false);
+  const renderExt = body => lazySection(body, "扩展特效（点击 / 拖尾 / 视差 / 头像 / 吉祥物）", false, wrap => {
     toggleRow(wrap, "ext.enabled", "扩展总开关");
     wrap.append(el("div", "hint", "总开关关闭时所有特效层都不创建；特效层 pointer-events:none，不会拦截任何原生点击。"));
 
@@ -1571,7 +1587,7 @@ function pageRuntime() {
     imagePicker(mascot, "mascot", "自定义立绘");
     mascot.append(el("div", "note", "拖动移动（位置自动保存）；点击开合壁纸选择器。只有吉祥物自身接收指针事件。"));
     wrap.append(mascot);
-  };
+  });
   /* The page keeps its own copy of the model so an imported preset can be validated
      before it ever reaches the stylesheet. It mirrors the Node-side normaliser. */
   const normalize = (raw, options) => {

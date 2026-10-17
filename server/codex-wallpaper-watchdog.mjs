@@ -3,9 +3,10 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { listWallpapers, resolveWallpaperMedia, invalidateWallpaperCache, uploadsDir } from "./wallpaper-library.mjs";
+import { listWallpapers, resolveWallpaperMedia, invalidateWallpaperCache, uploadsDir, WEB_TYPES } from "./wallpaper-library.mjs";
 import { APPEARANCE_BUILD, hydrateExtImages, normalizeAppearance, withFactoryPresets } from "./appearance.mjs";
 import { TRANSITION_MS, filterWallpapers, libraryPayload, normalizeLibrary, tagOf } from "./library-state.mjs";
+import { buildWebDocument, webPreludeSource, webPropertyPayload } from "./web-wallpaper.mjs";
 
 const root = import.meta.dirname;
 const stateRoot = path.join(process.env.APPDATA || os.homedir(), "Codex", "luna-beautiful-codex");
@@ -276,7 +277,7 @@ async function acquireServer() {
           res.end(JSON.stringify(listWallpapers().map(item => ({
             id: item.id, title: item.title, custom: !!item.custom, kind: item.kind || "image",
             tag: tagOf(library, item.id), hidden: hidden.has(item.id),
-            quality: item.renderMode === "native" ? "原生高清" : item.renderMode === "webgl" ? "WebGL渲染" : "静态预览", renderMode: item.renderMode
+            quality: item.renderMode === "native" ? "原生高清" : item.renderMode === "webgl" ? "WebGL渲染" : item.renderMode === "web" ? "网页壁纸" : "静态预览", renderMode: item.renderMode
           }))));
         } else if (url.pathname === "/select") {
           const id = url.searchParams.get("id") || "";
@@ -335,9 +336,32 @@ async function acquireServer() {
             res.end(JSON.stringify({ ...prefs(), appearance: appearanceState() }));
           }
         } else if (url.pathname === "/status") {
-          const payload = { selection: selection(), prefs: prefs(), appearance: appearanceState(), library: libraryState(), rotation: rotationState(), glassEconomy, pid: process.pid, deferredUpgrade: lastDeferredUpgrade, quality: lastQuality, lastQualityEvent: lastQuality, qualitySettledForScene: [...qualitySceneStats].filter(([, v]) => v.settled).map(([id]) => id), contextRemounts, version: pluginVersion, pluginDir };
+          const payload = { selection: selection(), prefs: prefs(), appearance: { ...appearanceState(), lastError: appearanceLastError }, library: libraryState(), rotation: rotationState(), glassEconomy, pid: process.pid, deferredUpgrade: lastDeferredUpgrade, quality: lastQuality, lastQualityEvent: lastQuality, qualitySettledForScene: [...qualitySceneStats].filter(([, v]) => v.settled).map(([id]) => id), contextRemounts, version: pluginVersion, pluginDir };
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify(payload));
+        } else if (url.pathname.startsWith("/web/")) {
+          /* Web wallpapers' relative assets. The page itself cannot fetch this
+             origin (CSP), so the srcdoc builder inlines them; the route stays
+             available for diagnostics and for hosts whose CSP allows frames. */
+          const parts = url.pathname.split("/").filter(Boolean);
+          const wid = parts[1];
+          const ww = listWallpapers().find(item => item.id === wid);
+          if (ww && ww.webDir && ww.webEntry) {
+            let rel = parts.slice(2).join("/");
+            try { rel = decodeURIComponent(rel); } catch { rel = ""; }
+            if (!rel) rel = path.basename(ww.webEntry);
+            const webRoot = path.resolve(ww.webDir);
+            const safe = path.resolve(webRoot, rel);
+            /* Same separator-aware containment check as /scene/: a plain
+               prefix test would accept sibling folders that merely share the
+               prefix (e.g. ../../<id>-evil). */
+            if ((safe === webRoot || safe.startsWith(webRoot + path.sep)) && !safe.includes("\0") && fs.existsSync(safe) && fs.statSync(safe).isFile()) {
+              const ext = path.extname(safe).toLowerCase();
+              const mime = WEB_TYPES.get(ext) || "application/octet-stream";
+              res.writeHead(200, { "content-type": mime, "cache-control": "no-store" });
+              fs.createReadStream(safe).pipe(res);
+            } else { res.writeHead(404, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: "web resource not found" })); }
+          } else { res.writeHead(404, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: "web wallpaper not found" })); }
         } else if (url.pathname.startsWith("/scene-fallback/")) {
           const fid = url.pathname.split("/").filter(Boolean)[1];
           const fw = listWallpapers().find(item => item.id === fid);
@@ -418,10 +442,10 @@ async function withPage(target, callback) {
     else waiter.resolve(message.result && message.result.result ? message.result.result.value : message.result);
   };
   socket.onclose = () => { for (const waiter of pending.values()) { try { waiter.reject(new Error("DevTools socket closed")); } catch {} } pending.clear(); };
-  async function command(method, params = {}, timeoutMs = 30000) {
+  function sendCommand(method, params = {}, timeoutMs = 30000) {
     const id = nextId++;
     socket.send(JSON.stringify({ id, method, params }));
-    return await new Promise((resolve, reject) => {
+    return new Promise((resolve, reject) => {
       /* A hidden/occluded app window can stall a DevTools evaluate forever
          (rAF-driven library code never settles); without this the watchdog
          main loop would stick on `restoring` and stop restoring entirely. */
@@ -432,7 +456,41 @@ async function withPage(target, callback) {
       });
     });
   }
-  try { return await callback(command); } finally { socket.close(); }
+  /* Raw variant: resolves with the whole CDP result so callers can inspect
+     exceptionDetails instead of turning a failed script into a thrown error. */
+  async function commandRaw(method, params = {}, timeoutMs = 30000) {
+    return await sendCommand(method, params, timeoutMs);
+  }
+  async function command(method, params = {}, timeoutMs = 30000) {
+    const message = await sendCommand(method, params, timeoutMs);
+    if (message && message.exceptionDetails) throw new Error(message.exceptionDetails.exception?.description || message.exceptionDetails.text);
+    return message && message.result ? message.result.value : message;
+  }
+  try { return await callback(command, commandRaw); } finally { socket.close(); }
+}
+
+/* sandbox="allow-scripts" without allow-same-origin gives the frame an opaque
+   origin, and Chromium runs it out of process: its execution context never
+   appears on the page target and Page.getFrameTree does not list it. Find the
+   iframe target whose window.name carries our per-mount token instead. */
+async function findWebFrameTarget(port, token, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/json/list`, { cache: "no-store" });
+      if (response.ok) {
+        const targets = await response.json();
+        for (const target of targets.filter(item => item.type === "iframe")) {
+          try {
+            const name = await withPage(target, command => command("Runtime.evaluate", { expression: "window.name", returnByValue: true }, 4000));
+            if (name === token) return target;
+          } catch {}
+        }
+      }
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 120));
+  }
+  return null;
 }
 
 async function status() {
@@ -489,6 +547,14 @@ async function status() {
         const picker = document.getElementById("codex-wallpaper-picker");
         const value = (picker && picker.dataset.uploadDelete) || "";
         if (picker) picker.dataset.uploadDelete = "";
+        return value;
+      })(),
+      /* Phase 4: wallpaper property edits. The picker leaves {id, props} here;
+         the loop persists it and pushes the values into the live instance. */
+      propsCommand: (() => {
+        const picker = document.getElementById("codex-wallpaper-picker");
+        const value = (picker && picker.dataset.propsCommand) || "";
+        if (picker) picker.dataset.propsCommand = "";
         return value;
       })(),
       /* Phase 3: avatar/mascot image hand-off. The panel parks the File on
@@ -719,6 +785,19 @@ async function installSceneWebGL(found, current, options = {}) {
   const installEpoch = selectEpoch;
   const wallpaper = listWallpapers().find(item => item.id === wallpaperId);
 
+  /* Wallpaper Engine general.properties for this scene. Defaults come from
+     project.json; the picker's saved values win. The instance API takes a
+     simple { key: value } map, and colours must arrive in WE's "r g b" form
+     (a bare "#rrggbb" reads back as black), so the shared normaliser runs
+     even for the mount-time defaults. */
+  const sceneProperties = {};
+  if (wallpaper && Array.isArray(wallpaper.properties) && wallpaper.properties.length) {
+    try {
+      const saved = libraryState().props[wallpaperId] || {};
+      for (const [key, entry] of Object.entries(webPropertyPayload(wallpaper.properties, saved))) sceneProperties[key] = entry.value;
+    } catch {}
+  }
+
   /* Resolve the best fallback media entirely on the Node side. Codex's page
      CSP blocks page-side fetch() to both the WebWallGL CDN and this watchdog
      server, so we inject the bytes through DevTools (bypassing CSP). Phase 2:
@@ -932,6 +1011,7 @@ async function installSceneWebGL(found, current, options = {}) {
         const libraryAvailable = ${JSON.stringify(!!libraryAvailable)};
         const PREWARM_ONLY = ${JSON.stringify(options.prewarm === true)};
         const PREWARM_TOKEN = ${JSON.stringify(options.prewarmToken || "")};
+        const PROPERTIES = ${JSON.stringify(sceneProperties)};
         /* A prewarm stages into its own hidden input so no other install can
            replace the File under the library lazy fileSource() read. */
         const FILE_INPUT_ID = PREWARM_ONLY ? ${JSON.stringify(PREWARM_FILE_INPUT_ID)} : ${JSON.stringify(FILE_INPUT_ID)};
@@ -1147,6 +1227,7 @@ async function installSceneWebGL(found, current, options = {}) {
             source,
             renderDpr,
             quality,
+            properties: PROPERTIES,
             onDiagnostic: (lvl, msg) => pushDiag(lvl, msg),
             onError: () => pushDiag("error", "mount onError"),
             ...extra
@@ -1173,6 +1254,9 @@ async function installSceneWebGL(found, current, options = {}) {
             } else { throw mountErr; }
           }
           if (!inst) throw new Error("WebWallGL mount returned no instance");
+          if (Object.keys(PROPERTIES).length && typeof inst.setProperties === "function") {
+            try { inst.setProperties(PROPERTIES); } catch (error) { pushDiag("error", "setProperties failed: " + String(error && error.message || error).slice(0, 120)); }
+          }
           if (PREWARM_ONLY) {
             /* Superseded while the mount was running: the drop already invalidated
                this token, so throw the fresh instance and its layer away rather
@@ -1249,13 +1333,269 @@ async function installSceneWebGL(found, current, options = {}) {
   }
   return result;
 }
+const WEB_FALLBACK_MAX_BYTES = 24 * 1024 * 1024;
+const WEB_LOAD_TIMEOUT_MS = 8000;
+
+const PREVIEW_MIME = { ".gif": "image/gif", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".avif": "image/avif" };
+
+/* Phase 4: Wallpaper Engine web projects.
+
+   The page cannot load 127.0.0.1 in a frame (CSP frame-src) and cannot run an
+   inline <script> inside srcdoc (CSP script-src), so the watchdog:
+     1. inlines styles/images/fonts/media into one srcdoc document,
+     2. mounts an iframe with sandbox="allow-scripts" only,
+     3. attaches to the frame's own DevTools target (the sandbox makes it an
+        out-of-process frame) and runs the prelude plus the project's scripts
+        through Runtime.evaluate there: global scope, unaffected by CSP.
+   The opaque origin keeps Codex cookies/localStorage out of reach; later
+   property edits travel through postMessage to the prelude, which calls
+   wallpaperPropertyListener.applyUserProperties inside the frame. */
+async function installWebWallpaper(found, current) {
+  const item = listWallpapers().find(entry => entry.id === current.source);
+  if (!item || !item.webEntry) return { ok: false, renderMode: "failed", source: current.source, error: "web wallpaper metadata missing" };
+  const built = buildWebDocument(item);
+  if (!built.ok) {
+    log(`web ${current.source}: document build failed (${built.error})`);
+    return { ok: false, renderMode: "failed", source: current.source, error: built.error };
+  }
+  if (built.warnings.length) log(`web ${current.source}: ${built.warnings.slice(0, 5).join(" | ")}${built.warnings.length > 5 ? " (+" + (built.warnings.length - 5) + " more)" : ""}`);
+
+  /* Same preference as the Scene fallback: a video that fits the budget is a
+     far better picture than the preview thumbnail, and when nothing fits the
+     switch reports failure instead of showing a broken frame. */
+  const fallbackCandidates = [];
+  if (item.preview && fs.existsSync(item.preview)) {
+    try { fallbackCandidates.push({ path: item.preview, mime: PREVIEW_MIME[path.extname(item.preview).toLowerCase()] || "image/gif", size: fs.statSync(item.preview).size }); } catch {}
+  }
+  if (item.webDir) {
+    try {
+      for (const name of fs.readdirSync(item.webDir).slice(0, 200)) {
+        const ext = path.extname(name).toLowerCase();
+        if (ext !== ".mp4" && ext !== ".webm") continue;
+        const candidate = path.join(item.webDir, name);
+        fallbackCandidates.push({ path: candidate, mime: ext === ".mp4" ? "video/mp4" : "video/webm", size: fs.statSync(candidate).size });
+        if (fallbackCandidates.length > 2) break;
+      }
+    } catch {}
+  }
+  const videoCandidate = fallbackCandidates.find(candidate => candidate.mime.startsWith("video/") && candidate.size > 0 && candidate.size <= WEB_FALLBACK_MAX_BYTES) || null;
+  const smallestCandidate = fallbackCandidates.filter(candidate => candidate.size > 0).sort((a, b) => a.size - b.size)[0] || null;
+  const chosenFallback = videoCandidate || (smallestCandidate && smallestCandidate.size <= WEB_FALLBACK_MAX_BYTES ? smallestCandidate : null);
+  const fallbackPath = chosenFallback ? chosenFallback.path : null;
+  const fallbackMime = chosenFallback ? chosenFallback.mime : "image/gif";
+
+  const propertyPayload = webPropertyPayload(item.properties, libraryState().props[current.source] || {});
+  const scriptCount = built.scripts.length;
+  /* Step 1 - mount. The frame stays at opacity 0 behind the current wallpaper
+     until its scripts have run, so a slow project never shows a black gap and
+     the old wallpaper keeps painting. */
+  const mountExpression = `(async () => {
+  const wallpaperId = ${JSON.stringify(current.source)};
+  const TOKEN = ${JSON.stringify(built.token)};
+  const SRCDOC = ${JSON.stringify(built.html)};
+  const TIMEOUT_MS = ${WEB_LOAD_TIMEOUT_MS};
+  document.getElementById("codex-custom-background-web-frame")?.remove();
+  document.getElementById("codex-custom-background-web-base")?.remove();
+  const stale = window.__lunaWebStage;
+  if (stale && stale.onMessage) { try { window.removeEventListener("message", stale.onMessage); } catch {} }
+  const oldLayers = ["codex-custom-background-base", "codex-custom-background-media"].map(id => document.getElementById(id)).filter(Boolean);
+  const previousInstance = window.__webwallglInstance;
+  window.__webwallglInstance = null;
+  const base = document.createElement("div");
+  base.setAttribute("data-wallpaper-source", wallpaperId);
+  base.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important;opacity:0";
+  const frame = document.createElement("iframe");
+  frame.id = "codex-custom-background-web-frame";
+  frame.name = TOKEN;
+  frame.setAttribute("sandbox", "allow-scripts");
+  frame.setAttribute("allow", "");
+  frame.setAttribute("referrerpolicy", "no-referrer");
+  frame.setAttribute("data-wallpaper-source", wallpaperId);
+  frame.setAttribute("data-render-mode", "web");
+  frame.style.cssText = "position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;border:0!important;background:#000!important;pointer-events:none!important;display:block!important;opacity:0";
+  const stage = { token: TOKEN, source: wallpaperId, base, frame, oldLayers, previousInstance, errors: [], booted: false, loaded: false, started: performance.now() };
+  stage.onMessage = event => {
+    if (!frame.contentWindow || event.source !== frame.contentWindow) return;
+    const data = event.data || {};
+    if (data.__lunaBooted === TOKEN) stage.booted = true;
+    if (data.__lunaWebError) stage.errors.push(String(data.__lunaWebError).slice(0, 220));
+  };
+  window.addEventListener("message", stage.onMessage);
+  window.__lunaWebStage = stage;
+  const waitLoad = new Promise(resolve => {
+    let done = false;
+    const finish = value => { if (done) return; done = true; resolve(value); };
+    frame.addEventListener("load", () => { stage.loaded = true; setTimeout(() => finish(true), 60); }, { once: true });
+    setTimeout(() => finish(false), TIMEOUT_MS);
+  });
+  document.body.prepend(frame);
+  document.body.prepend(base);
+  frame.srcdoc = SRCDOC;
+  await waitLoad;
+  return { loaded: stage.loaded, booted: stage.booted, webMs: Math.round(performance.now() - stage.started), errors: stage.errors.slice(0, 6) };
+})()`;
+
+  /* Step 2 - reveal. Runs after the project scripts and properties landed. */
+  const revealExpression = `${SWITCH_SOURCE}
+(() => {
+  const stage = window.__lunaWebStage;
+  if (!stage || !stage.frame || !stage.frame.isConnected) return { ok: false, error: "web stage missing" };
+  const frame = stage.frame;
+  const base = stage.base;
+  const oldLayers = stage.oldLayers || [];
+  try { window.removeEventListener("message", stage.onMessage); } catch {}
+  const whenIdle = (fn, timeoutMs) => { const run = () => { try { fn(); } catch {} }; try { if (typeof window.requestIdleCallback === "function") { window.requestIdleCallback(run, { timeout: timeoutMs }); return; } } catch {} setTimeout(run, timeoutMs); };
+  const loseGl = el => { try { const ctx = el && el.getContext ? (el.getContext("webgl2") || el.getContext("webgl")) : null; const ext = ctx && ctx.getExtension ? ctx.getExtension("WEBGL_lose_context") : null; if (ext) ext.loseContext(); } catch {} };
+  frame.id = "codex-custom-background-media";
+  frame.setAttribute("data-web-ready", "true");
+  frame.setAttribute("data-web-scripts", ${JSON.stringify(String(scriptCount))});
+  base.id = "codex-custom-background-base";
+  window.__lunaWeb = { source: stage.source, token: stage.token, at: Date.now(), scripts: ${JSON.stringify(scriptCount)} };
+  window.__lunaSwitchTransition(base, frame, oldLayers, ${JSON.stringify(transitionFor())}, () => {
+    for (const old of oldLayers) {
+      if (!old || !old.isConnected || old === frame || old === base) continue;
+      const deadCanvas = old.querySelector ? old.querySelector("canvas") : null;
+      const deadUrl = old.getAttribute ? old.getAttribute("data-object-url") : null;
+      whenIdle(() => { try { if (deadCanvas) loseGl(deadCanvas); if (deadUrl) URL.revokeObjectURL(deadUrl); if (old.pause) old.pause(); old.remove(); } catch {} }, 700);
+    }
+    const previousInstance = stage.previousInstance;
+    if (previousInstance) whenIdle(() => { try { previousInstance.destroy && previousInstance.destroy(); } catch {} try { previousInstance.unmount && previousInstance.unmount(); } catch {} try { previousInstance.dispose && previousInstance.dispose(); } catch {} }, 1000);
+  });
+  return { ok: true, webMs: Math.round(performance.now() - stage.started) };
+})()`;
+
+  /* Step 3 - fallback. Uses the frame's prepared base layer so no second black
+     gap appears; the temp frame is dropped before the media mounts. */
+  const fallbackExpression = (reason, fileIndex) => `${SWITCH_SOURCE}
+(() => {
+  const stage = window.__lunaWebStage;
+  const wallpaperId = ${JSON.stringify(current.source)};
+  const REASON = ${JSON.stringify(String(reason || "web wallpaper unavailable"))};
+  const FALLBACK = ${JSON.stringify({ index: Number(fileIndex), mime: fallbackMime })};
+  const FILE_INPUT_ID = ${JSON.stringify(FILE_INPUT_ID)};
+  const whenIdle = (fn, timeoutMs) => { const run = () => { try { fn(); } catch {} }; try { if (typeof window.requestIdleCallback === "function") { window.requestIdleCallback(run, { timeout: timeoutMs }); return; } } catch {} setTimeout(run, timeoutMs); };
+  const loseGl = el => { try { const ctx = el && el.getContext ? (el.getContext("webgl2") || el.getContext("webgl")) : null; const ext = ctx && ctx.getExtension ? ctx.getExtension("WEBGL_lose_context") : null; if (ext) ext.loseContext(); } catch {} };
+  const base = stage && stage.base ? stage.base : document.createElement("div");
+  const oldLayers = stage && stage.oldLayers ? stage.oldLayers : [];
+  const previousInstance = stage && stage.previousInstance ? stage.previousInstance : window.__webwallglInstance;
+  if (stage) { try { window.removeEventListener("message", stage.onMessage); } catch {} try { stage.frame.remove(); } catch {} }
+  const input = document.getElementById(FILE_INPUT_ID);
+  const file = input && FALLBACK.index >= 0 && input.files ? input.files[FALLBACK.index] : null;
+  if (!file) { try { base.remove(); } catch {} return { ok: false, renderMode: "failed", source: wallpaperId, error: REASON }; }
+  const url = URL.createObjectURL(file);
+  const isVideo = FALLBACK.mime.indexOf("video/") === 0;
+  const el = document.createElement(isVideo ? "video" : "img");
+  el.src = url;
+  el.setAttribute("data-object-url", url);
+  el.setAttribute("data-wallpaper-source", wallpaperId);
+  el.setAttribute("data-render-mode", "fallback");
+  el.setAttribute("data-background-opacity", "1");
+  el.setAttribute("data-surface-opacity", "0");
+  el.setAttribute("data-blur", "0");
+  if (isVideo) { el.autoplay = true; el.loop = true; el.muted = true; el.playsInline = true; el.disablePictureInPicture = true; }
+  el.style.cssText = "position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;object-fit:cover!important;z-index:0!important;pointer-events:none!important;background:#000;opacity:0";
+  el.id = "codex-custom-background-media";
+  base.id = "codex-custom-background-base";
+  document.body.prepend(el);
+  window.__lunaSwitchTransition(base, el, oldLayers, ${JSON.stringify(transitionFor())}, () => {
+    for (const old of oldLayers) {
+      if (!old || !old.isConnected || old === el || old === base) continue;
+      const deadCanvas = old.querySelector ? old.querySelector("canvas") : null;
+      const deadUrl = old.getAttribute ? old.getAttribute("data-object-url") : null;
+      whenIdle(() => { try { if (deadCanvas) loseGl(deadCanvas); if (deadUrl) URL.revokeObjectURL(deadUrl); if (old.pause) old.pause(); old.remove(); } catch {} }, 700);
+    }
+    if (previousInstance) whenIdle(() => { try { previousInstance.destroy && previousInstance.destroy(); } catch {} try { previousInstance.unmount && previousInstance.unmount(); } catch {} try { previousInstance.dispose && previousInstance.dispose(); } catch {} }, 1000);
+  });
+  if (isVideo) el.play().catch(() => {});
+  return { ok: true, renderMode: "fallback", webError: REASON, source: wallpaperId, via: "file", fallbackMime: FALLBACK.mime };
+})()`;
+
+  const result = await withPage(found.target, async command => {
+    let fallbackIndex = -1;
+    if (fallbackPath) {
+      const primed = await primeWallpaperFiles(command, [fallbackPath]);
+      fallbackIndex = primed.ok ? primed.paths.indexOf(fallbackPath) : -1;
+      if (!primed.ok) log(`web ${current.source}: fallback file channel unavailable (${primed.error})`);
+    }
+    const mount = await command("Runtime.evaluate", { expression: mountExpression, returnByValue: true, awaitPromise: true }, WEB_LOAD_TIMEOUT_MS + 12000);
+    if (!mount || !mount.loaded) {
+      const reason = !mount ? "web mount gave no answer" : "iframe load timeout";
+      if (mount && mount.errors && mount.errors.length) log(`web ${current.source}: ${mount.errors.slice(0, 3).join(" | ")}`);
+      const outcome = await command("Runtime.evaluate", { expression: fallbackExpression(reason, fallbackIndex), returnByValue: true, awaitPromise: true }, 12000);
+      if (outcome) outcome.webErrors = (mount && mount.errors) || [];
+      return outcome;
+    }
+
+    /* The frame is out of process, so both the prelude and the project's
+       scripts run through a second CDP session attached to the iframe target
+       (Page.addScriptToEvaluateOnNewDocument never reaches an OOPIF). Only a
+       target whose window.name matches this mount's token is accepted:
+       guessing could run a wallpaper's script inside Codex's own page. */
+    const frameTarget = await findWebFrameTarget(found.port, built.token);
+    const scriptErrors = [];
+    if (!frameTarget) scriptErrors.push("script context unavailable");
+    if (frameTarget) {
+      try {
+        await withPage(frameTarget, async (frameCommand, frameRaw) => {
+          /* Installs the property/error bridge. Must run before the project's
+             scripts so a listener they define is picked up lazily. */
+          await frameCommand("Runtime.evaluate", { expression: webPreludeSource(built.token), returnByValue: false }, 8000);
+          for (let index = 0; index < scriptCount; index += 1) {
+            try {
+              const evaluated = await frameRaw("Runtime.evaluate", { expression: built.scripts[index], returnByValue: false, awaitPromise: false }, 20000);
+              if (evaluated && evaluated.exceptionDetails) scriptErrors.push("script-" + index + ": " + String(evaluated.exceptionDetails.exception?.description || evaluated.exceptionDetails.text || "error").slice(0, 180));
+            } catch (error) {
+              scriptErrors.push("script-" + index + ": " + String(error.message).slice(0, 180));
+            }
+          }
+          if (Object.keys(propertyPayload).length) {
+            try {
+              const applied = await frameCommand("Runtime.evaluate", {
+                expression: `(() => {
+                  const payload = ${JSON.stringify(propertyPayload)};
+                  const keys = Object.keys(payload);
+                  const listener = window.wallpaperPropertyListener;
+                  try {
+                    if (listener && typeof listener.applyUserProperties === "function") listener.applyUserProperties(payload);
+                    else if (typeof window.applyUserProperties === "function") window.applyUserProperties(payload);
+                    else return { ok: false, via: "missing", keys: keys };
+                  } catch (error) { return { ok: false, via: "throw", error: String(error && error.message || error), keys: keys }; }
+                  return { ok: true, via: "listener", keys: keys };
+                })()`,
+                returnByValue: true,
+                awaitPromise: false
+              }, 8000);
+              if (!applied || !applied.ok) scriptErrors.push("properties: " + JSON.stringify(applied));
+            } catch (error) {
+              scriptErrors.push("properties: " + String(error.message).slice(0, 180));
+            }
+          }
+        });
+      } catch (error) {
+        scriptErrors.push("frame session: " + String(error.message).slice(0, 180));
+      }
+    }
+
+    const reveal = await command("Runtime.evaluate", { expression: revealExpression, returnByValue: true, awaitPromise: true }, 12000);
+    if (!reveal || !reveal.ok) {
+      const outcome = await command("Runtime.evaluate", { expression: fallbackExpression("web reveal failed", fallbackIndex), returnByValue: true, awaitPromise: true }, 12000);
+      return outcome;
+    }
+    if (scriptErrors.length) log(`web ${current.source}: script issues (${scriptErrors.slice(0, 4).join(" | ")})`);
+    return { ok: true, renderMode: "web", source: current.source, scripts: scriptCount, inlineBytes: built.inlineBytes, webMs: mount.webMs, scriptErrors: scriptErrors.length, scriptErrorSample: scriptErrors.slice(0, 3), via: frameTarget ? "cdp-scripts" : "static" };
+  });
+  if (result) log(`web ${current.source}: renderMode=${result.renderMode}${result.webMs ? " webMs=" + result.webMs : ""}${result.scripts !== undefined ? " scripts=" + result.scripts : ""}${result.inlineBytes ? " inlineBytes=" + result.inlineBytes : ""}${result.via ? " via=" + result.via : ""}${result.scriptErrors !== undefined ? " scriptErrors=" + result.scriptErrors : ""}${result.webError ? " webError=" + String(result.webError).slice(0, 160) : ""}${result.error ? " error=" + String(result.error).slice(0, 160) : ""}`);
+  return result;
+}
 async function installBackground(current) {
   const found = await findPage();
   if (!found) throw new Error("Codex main page disappeared");
   const media = mediaMeta(current.source);
   if (media.renderMode === "webgl") return await installSceneWebGL(found, current);
+  if (media.renderMode === "web") return await installWebWallpaper(found, current);
   const installEpoch = selectEpoch;
   const isVideo = media.type.startsWith("video/");
+  const videoAudio = libraryState().video || { audio: false, volume: 70 };
   const nativeRawChunk = 3 * 1024 * 1024;
   const result = await withPage(found.target, async command => {
     /* Preferred path: the page reads the media straight off disk through the
@@ -1289,6 +1629,7 @@ async function installBackground(current) {
         window.__webwallglInstance = null;
         document.getElementById("codex-custom-background-base-pending")?.remove();
         const fileIndex = ${JSON.stringify(fileIndex)};
+        const AUDIO = ${JSON.stringify({ enabled: videoAudio.audio === true, volume: videoAudio.volume })};
         const mediaInput = document.getElementById(${JSON.stringify(FILE_INPUT_ID)});
         const mediaFile = mediaInput && mediaInput.files && fileIndex >= 0 ? mediaInput.files[fileIndex] : null;
         const bytes = window.__codexWallpaperBytes ? window.__codexWallpaperBytes.bytes : null;
@@ -1368,7 +1709,44 @@ async function installBackground(current) {
           }
           if (previousInstance) whenIdle(() => { try { previousInstance.destroy && previousInstance.destroy(); } catch {} try { previousInstance.unmount && previousInstance.unmount(); } catch {} try { previousInstance.dispose && previousInstance.dispose(); } catch {} }, 1000);
         });
-        if (${JSON.stringify(isVideo)}) el.play().catch(() => {});
+        if (${JSON.stringify(isVideo)}) {
+          el.setAttribute("data-video-audio", AUDIO.enabled ? "on" : "off");
+          el.volume = Math.max(0, Math.min(1, (Number(AUDIO.volume) || 0) / 100));
+          const showAudioHint = () => {
+            let hint = document.getElementById("codex-video-audio-hint");
+            if (!hint) {
+              hint = document.createElement("div");
+              hint.id = "codex-video-audio-hint";
+              hint.textContent = "🔊 点击页面一次以启用壁纸声音";
+              hint.style.cssText = "position:fixed;right:18px;bottom:64px;z-index:99999;padding:8px 12px;border-radius:10px;background:rgba(12,20,32,.92);color:#dbeafe;font:600 12px/1.4 system-ui;pointer-events:none;box-shadow:0 6px 24px rgba(0,0,0,.4)";
+              document.body.append(hint);
+            }
+            hint.style.display = "block";
+            clearTimeout(window.__lunaAudioHintTimer);
+            window.__lunaAudioHintTimer = setTimeout(() => { const node = document.getElementById("codex-video-audio-hint"); if (node) node.style.display = "none"; }, 8000);
+            if (!window.__lunaAudioGestureBound) {
+              window.__lunaAudioGestureBound = true;
+              window.addEventListener("pointerdown", () => {
+                const live = document.getElementById("codex-custom-background-media");
+                if (live && live.tagName === "VIDEO" && live.muted) { live.muted = false; live.play().catch(() => {}); }
+                const node = document.getElementById("codex-video-audio-hint"); if (node) node.style.display = "none";
+              }, { capture: true, once: true });
+            }
+          };
+          if (!AUDIO.enabled) {
+            el.muted = true;
+            el.play().catch(() => {});
+          } else {
+            /* Audible autoplay needs a user gesture. Try it first (a gesture may
+               already have happened in this page), and fall back to muted
+               playback plus one explicit hint rather than a hard failure. */
+            el.muted = false;
+            const attempt = el.play();
+            if (attempt && typeof attempt.catch === "function") {
+              attempt.catch(() => { el.muted = true; el.setAttribute("data-video-audio", "blocked"); el.play().catch(() => {}); showAudioHint(); });
+            }
+          }
+        }
         return { bytes: byteLen, type: ${JSON.stringify(media.type)}, renderMode: ${JSON.stringify(media.renderMode)}, source: ${JSON.stringify(current.source)}, via: ${JSON.stringify(via)} };
       })()`,
       returnByValue: true,
@@ -1404,6 +1782,55 @@ async function pageEval(expression, timeoutMs = 20000) {
   const found = await findPage();
   if (!found) return null;
   return await withPage(found.target, command => command("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, timeoutMs));
+}
+
+/* Phase 4: push saved property values into whatever is live. Scenes take the
+   simple { key: value } map through setProperties(); web wallpapers receive the
+   Wallpaper Engine { key: { value } } payload over postMessage so the sandboxed
+   frame never needs a same-origin bridge. */
+async function applyWallpaperProperties(id, values) {
+  const payload = values && typeof values === "object" && !Array.isArray(values) ? values : {};
+  const item = listWallpapers().find(entry => entry.id === String(id));
+  const hasDefs = !!(item && Array.isArray(item.properties) && item.properties.length);
+  const expanded = hasDefs ? webPropertyPayload(item.properties, payload) : Object.fromEntries(Object.entries(payload).map(([key, value]) => [key, { value }]));
+  /* The WebWallGL instance takes bare values, the sandboxed web frame takes
+     the { key: { value } } envelope. */
+  const normalised = hasDefs ? Object.fromEntries(Object.entries(expanded).map(([key, entry]) => [key, entry.value])) : payload;
+  return await pageCommand(`(() => {
+    const media = document.getElementById("codex-custom-background-media");
+    const source = media && media.getAttribute("data-wallpaper-source");
+    if (source && source !== ${JSON.stringify(String(id))}) return { ok: false, via: "not-current", source };
+    const props = ${JSON.stringify(normalised)};
+    if (media && media.tagName === "IFRAME" && media.getAttribute("data-render-mode") === "web" && media.contentWindow) {
+      const expanded = ${JSON.stringify(expanded)};
+      try { media.contentWindow.postMessage({ __lunaProps: expanded }, "*"); return { ok: true, via: "web" }; }
+      catch (error) { return { ok: false, via: "web", error: String(error && error.message || error) }; }
+    }
+    const instance = window.__webwallglInstance;
+    if (instance && typeof instance.setProperties === "function") {
+      try { instance.setProperties(props); return { ok: true, via: "webgl" }; }
+      catch (error) { return { ok: false, via: "webgl", error: String(error && error.message || error) }; }
+    }
+    return { ok: false, via: (media && media.getAttribute("data-render-mode")) || "none" };
+  })()`);
+}
+
+/* Phase 4: native video audio. The setting lives in library.video so the picker
+   can change it without a separate channel. */
+async function applyVideoAudio(audio) {
+  const settings = audio && typeof audio === "object" ? audio : { audio: false, volume: 70 };
+  return await pageCommand(`(() => {
+    const el = document.getElementById("codex-custom-background-media");
+    if (!el || el.tagName !== "VIDEO") return { ok: false, via: el ? el.tagName : "none" };
+    const enabled = ${JSON.stringify(settings.audio === true)};
+    const volume = Math.max(0, Math.min(100, Number(${JSON.stringify(settings.volume)}) || 0));
+    el.volume = Math.max(0, Math.min(1, volume / 100));
+    el.muted = !enabled;
+    el.setAttribute("data-video-audio", enabled ? "on" : "off");
+    if (enabled) el.play().catch(() => { el.muted = true; el.setAttribute("data-video-audio", "blocked"); el.play().catch(() => {}); });
+    else { const hint = document.getElementById("codex-video-audio-hint"); if (hint) hint.style.display = "none"; }
+    return { ok: true, via: "video", muted: el.muted, volume: Math.round(el.volume * 100) };
+  })()`);
 }
 /* Per-scene downgrade bookkeeping. A transition into the downgraded state is one
    event. Two events inside the settle window count as a loop, and so does a
@@ -1462,6 +1889,7 @@ function nextTick(delayMs = IDLE_TICK_MS) {
 let controlsRunning = false;
 let pickerRunning = false;
 let appearanceRunning = false;
+let appearanceLastError = null;
 function launchControls() {
   controlsRunning = true;
   const child = spawn(process.execPath, [controlsScript], { windowsHide: true, cwd: root, stdio: "ignore" });
@@ -1476,9 +1904,18 @@ function launchPicker() {
 }
 function launchAppearance() {
   appearanceRunning = true;
-  const child = spawn(process.execPath, [appearanceScript], { windowsHide: true, cwd: root, stdio: "ignore" });
-  child.once("error", error => { appearanceRunning = false; log(`appearance error: ${error.message}`); });
-  child.once("exit", code => { appearanceRunning = false; log(code === 0 ? "appearance panel restored" : `appearance exited ${code}`); });
+  const child = spawn(process.execPath, [appearanceScript], { windowsHide: true, cwd: root, stdio: ["ignore", "ignore", "pipe"] });
+  let stderr = "";
+  try { if (child.stderr) child.stderr.on("data", chunk => { stderr = (stderr + chunk.toString()).slice(-4000); }); } catch {}
+  child.once("error", error => { appearanceRunning = false; appearanceLastError = "spawn failed: " + error.message; log(`appearance error: ${error.message}`); });
+  child.once("exit", code => {
+    appearanceRunning = false;
+    if (code === 0) { appearanceLastError = null; log("appearance panel restored"); }
+    else {
+      appearanceLastError = `appearance exited ${code}${stderr.trim() ? ": " + stderr.trim().slice(-300) : ""}`;
+      log(appearanceLastError);
+    }
+  });
 }
 
 try {
@@ -1501,6 +1938,7 @@ const rotationFailed = new Map();
 let lastLibraryRequest = "";
 let libraryMirrorPending = false;
 let appearanceMirrorPending = false;
+let lastVideoAudio = "";
 let lastHoverCommand = "";
 let recentInteractionAt = 0;
 let glassEconomy = null;
@@ -1869,7 +2307,7 @@ for (;;) {
         const parsed = JSON.parse(state.appearanceCommand);
         const saved = writeAppearance(parsed && parsed.appearance !== undefined ? parsed.appearance : parsed);
         log(`appearance prefs saved via panel (preset=${saved.activePreset}, glass=${saved.glass.enabled})`);
-      } catch (error) { log(`appearance command rejected: ${error.message}`); }
+      } catch (error) { appearanceLastError = "appearance command rejected: " + error.message; log(appearanceLastError); }
     }
     if (state.page && (state.appearanceRefresh !== lastAppearanceRefresh || appearanceMirrorPending)) {
       lastAppearanceRefresh = state.appearanceRefresh || "";
@@ -1890,6 +2328,20 @@ for (;;) {
         else if (!rotationNextAt) rotationNextAt = Date.now() + saved.rotation.intervalSec * 1000;
       } catch (error) { log("library command rejected: " + error.message); }
     }
+    /* ---- Phase 4: per-wallpaper properties ---- */
+    if (state.page && state.propsCommand) {
+      try {
+        const parsed = JSON.parse(state.propsCommand);
+        const id = String(parsed && parsed.id || "");
+        const values = parsed && parsed.props && typeof parsed.props === "object" && !Array.isArray(parsed.props) ? parsed.props : null;
+        if (!id || !values) throw new Error("expected {id, props}");
+        const currentLibrary = libraryState();
+        writeLibrary({ ...currentLibrary, props: { ...currentLibrary.props, [id]: values } });
+        libraryMirrorPending = true;
+        const applied = await applyWallpaperProperties(id, values);
+        log(`wallpaper props saved for ${id} (${applied && applied.ok ? "applied via " + applied.via : "not applied: " + ((applied && applied.via) || "no page")})`);
+      } catch (error) { log("props command rejected: " + error.message); }
+    }
     if (state.page && (state.libraryRequest !== lastLibraryRequest || libraryMirrorPending)) {
       lastLibraryRequest = state.libraryRequest || "";
       libraryMirrorPending = false;
@@ -1901,6 +2353,12 @@ for (;;) {
     /* ---- Phase 2: auto rotation ---- */
     let rotationTargetFromRotation = "";
     const library = libraryState();
+    const audioKey = (library.video && library.video.audio ? "1" : "0") + ":" + (library.video ? library.video.volume : 70);
+    if (state.page && audioKey !== lastVideoAudio) {
+      lastVideoAudio = audioKey;
+      const audioApplied = await applyVideoAudio(library.video || { audio: false, volume: 70 });
+      if (audioApplied && audioApplied.ok) log(`video audio ${library.video && library.video.audio ? "on" : "off"} volume=${library.video ? library.video.volume : 70}`);
+    }
     if (!library.rotation.enabled) {
       rotationNextAt = 0;
       rotationPending = null;

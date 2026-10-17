@@ -60,9 +60,10 @@ const wallpapers = listWallpapers().map(item => ({
   id: item.id,
   title: item.title,
   kind: item.kind || "image",
-  quality: item.renderMode === "native" ? "原生高清" : item.renderMode === "webgl" ? "WebGL渲染" : "静态预览",
+  quality: item.renderMode === "native" ? "原生高清" : item.renderMode === "webgl" ? "WebGL渲染" : item.renderMode === "web" ? "网页壁纸" : "静态预览",
   renderMode: item.renderMode,
-  custom: !!item.custom
+  custom: !!item.custom,
+  properties: Array.isArray(item.properties) ? item.properties : []
 }));
 
 const library = normalizeLibrary(readLibrary());
@@ -118,6 +119,13 @@ const expression = `(() => {
       .grid2{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding-bottom:8px}
       .field{display:grid;gap:3px;font:600 10.5px/1.2 inherit;color:#a9bbd2}
       .field select,.field input[type=number]{height:26px;border:1px solid rgba(255,255,255,.16);border-radius:8px;background:rgba(20,30,46,.95);color:#dbe8f8;font:600 11px/1 inherit;padding:0 6px}
+      .propsHost{display:grid;gap:5px;padding:2px 0 8px}
+      .propRow{display:grid;grid-template-columns:minmax(0,1fr) minmax(92px,42%);gap:7px;align-items:center;font:600 10.5px/1.2 inherit;color:#b9cbe0}
+      .propRow input[type=text],.propRow input[type=number],.propRow select{width:100%;height:25px;border:1px solid rgba(255,255,255,.16);border-radius:8px;background:rgba(20,30,46,.95);color:#dbe8f8;font:600 10.5px/1 inherit;padding:0 6px}
+      .propRow input[type=color]{width:100%;height:25px;border:1px solid rgba(255,255,255,.16);border-radius:8px;background:rgba(20,30,46,.95);padding:2px}
+      .propRow input[type=checkbox]{width:16px;height:16px;justify-self:end}
+      .propRow input[type=range]{width:100%}
+      .propsHint{font:600 10.5px/1.35 inherit;color:#8fa3bb;padding:2px 0 6px}
       .status{min-height:16px;margin-top:7px;font:600 11px/1.3 inherit;color:#9db1ca}
       .status.err{color:#fca5a5}
       .confirm{display:flex;gap:5px;align-items:center;margin-top:7px}
@@ -133,12 +141,17 @@ const expression = `(() => {
           <button class="chip" data-type="scene">场景</button>
           <button class="chip" data-type="video">视频</button>
           <button class="chip" data-type="image">图片</button>
+          <button class="chip" data-type="web">网页</button>
         </div>
         <div class="row2">
           <select class="tag"><option value="all">全部标签</option><option value="safe">安全</option><option value="suggestive">轻度</option><option value="nsfw">成人</option></select>
           <label class="check"><input type="checkbox" class="showHidden">显示已隐藏</label>
         </div>
       </div>
+      <details class="propsPanel">
+        <summary>壁纸属性</summary>
+        <div class="propsHost"></div>
+      </details>
       <div class="list"></div>
       <div class="bulk">
         <button class="mini" data-act="unhideAll">全部显示</button>
@@ -162,6 +175,13 @@ const expression = `(() => {
           <label class="field">速度<select class="tspeed"><option value="fast">快 220ms</option><option value="normal">标准 360ms</option><option value="slow">慢 560ms</option></select></label>
         </div>
       </details>
+      <details>
+        <summary>视频音轨</summary>
+        <div class="grid2">
+          <label class="check"><input type="checkbox" class="audioOn">启用视频声音</label>
+          <label class="field">音量<input type="range" class="audioVol" min="0" max="100" step="1"></label>
+        </div>
+      </details>
       <div class="confirm" style="display:none">
         <span class="confirmText"></span>
         <button class="mini" data-del="keep">仅移出列表</button>
@@ -174,7 +194,7 @@ const expression = `(() => {
   \`;  const wallpapers = __WALLPAPERS__;
   const state = {
     library: __LIBRARY__,
-    items: wallpapers.map(item => ({ id: item.id, title: item.title, kind: item.kind, quality: item.quality, renderMode: item.renderMode, custom: item.custom, tag: "safe", hidden: false })),
+    items: wallpapers.map(item => ({ id: item.id, title: item.title, kind: item.kind, quality: item.quality, renderMode: item.renderMode, custom: item.custom, properties: item.properties || [], tag: "safe", hidden: false })),
     rotation: null
   };
   const hostRoot = host;
@@ -193,9 +213,12 @@ const expression = `(() => {
   const tMode = shadow.querySelector(".tmode");
   const tDir = shadow.querySelector(".tdir");
   const tSpeed = shadow.querySelector(".tspeed");
+  const audioOn = shadow.querySelector(".audioOn");
+  const audioVol = shadow.querySelector(".audioVol");
   const uploader = shadow.querySelector(".uploader");
   const confirmBar = shadow.querySelector(".confirm");
   const confirmText = shadow.querySelector(".confirmText");
+  const propsHost = shadow.querySelector(".propsHost");
   let pendingDelete = null;
   let pointerDown = false;
   let hoverId = "";
@@ -205,6 +228,11 @@ const expression = `(() => {
   let uploadQueue = [];
   let uploadSeen = 0;
   let uploadBusy = false;
+  {
+    const video = state.library.video || { audio: false, volume: 70 };
+    audioOn.checked = !!video.audio;
+    audioVol.value = String(Number(video.volume) || 0);
+  }
 
   function setStatus(text, isError) {
     status.textContent = text;
@@ -220,6 +248,112 @@ const expression = `(() => {
   function save() {
     localSaveAt = Date.now();
     hostRoot.dataset.libraryCommand = JSON.stringify({ op: "save", library: state.library });
+  }
+
+  /* ---- wallpaper properties (Wallpaper Engine general.properties) ---- */
+  function propStore() {
+    if (!state.library.props || typeof state.library.props !== "object") state.library.props = {};
+    return state.library.props;
+  }
+  function propsOf(id) {
+    const values = propStore()[id];
+    return values && typeof values === "object" ? values : {};
+  }
+  function colorToHex(value) {
+    const text = String(value == null ? "" : value).trim();
+    if (/^#[0-9a-f]{6}$/i.test(text)) return text;
+    if (/^#[0-9a-f]{3}$/i.test(text)) return "#" + text[1] + text[1] + text[2] + text[2] + text[3] + text[3];
+    const parts = text.split(/[\s,]+/).map(Number);
+    if (parts.length >= 3 && parts.slice(0, 3).every(Number.isFinite)) {
+      const channel = n => Math.max(0, Math.min(255, Math.round(n <= 1 ? n * 255 : n)));
+      return "#" + parts.slice(0, 3).map(n => channel(n).toString(16).padStart(2, "0")).join("");
+    }
+    return "#ffffff";
+  }
+  function hexToWeColor(value) {
+    const match = /^#([0-9a-f]{6})$/i.exec(String(value || ""));
+    if (!match) return String(value || "#ffffff");
+    const n = parseInt(match[1], 16);
+    const channel = v => (v / 255).toFixed(3).replace(/0+$/, "").replace(/[.]$/, "");
+    return channel((n >> 16) & 255) + " " + channel((n >> 8) & 255) + " " + channel(n & 255);
+  }
+  function pushProps(id, values) {
+    const all = { ...propStore() };
+    all[id] = { ...values };
+    state.library.props = all;
+    save();
+    hostRoot.dataset.propsCommand = JSON.stringify({ id, props: all[id], t: Date.now() });
+  }
+  function renderProps() {
+    propsHost.textContent = "";
+    const active = currentSource();
+    const item = state.items.find(entry => entry.id === active);
+    if (!item) {
+      const hint = document.createElement("div");
+      hint.className = "propsHint";
+      hint.textContent = "选择一张壁纸后可调整它的属性";
+      propsHost.append(hint);
+      return;
+    }
+    const defs = Array.isArray(item.properties) ? item.properties : [];
+    if (!defs.length) {
+      const hint = document.createElement("div");
+      hint.className = "propsHint";
+      hint.textContent = "「" + item.title + "」没有可调属性";
+      propsHost.append(hint);
+      return;
+    }
+    const saved = propsOf(item.id);
+    for (const def of defs) {
+      const row = document.createElement("label");
+      row.className = "propRow";
+      const name = document.createElement("span");
+      name.textContent = def.text || def.key;
+      let input = null;
+      const value = saved[def.key] !== undefined ? saved[def.key] : def.value;
+      if (def.type === "bool") {
+        input = document.createElement("input");
+        input.type = "checkbox";
+        input.checked = value === true;
+      } else if (def.type === "color") {
+        input = document.createElement("input");
+        input.type = "color";
+        input.value = colorToHex(value);
+      } else if (def.type === "slider") {
+        input = document.createElement("input");
+        input.type = "range";
+        input.min = String(def.min ?? 0);
+        input.max = String(def.max ?? 100);
+        input.step = String(def.step ?? 1);
+        input.value = String(value ?? def.min ?? 0);
+      } else if (def.type === "combo") {
+        input = document.createElement("select");
+        for (const option of def.options || []) {
+          const node = document.createElement("option");
+          node.value = option.value;
+          node.textContent = option.label;
+          input.append(node);
+        }
+        input.value = String((value ?? (def.options && def.options[0] && def.options[0].value)) || "");
+      } else {
+        input = document.createElement("input");
+        input.type = "text";
+        input.value = String(value ?? "");
+      }
+      input.dataset.propKey = def.key;
+      input.dataset.propType = def.type;
+      input.onchange = () => {
+        const next = { ...propsOf(item.id) };
+        if (def.type === "bool") next[def.key] = !!input.checked;
+        else if (def.type === "color") next[def.key] = hexToWeColor(input.value);
+        else if (def.type === "slider") next[def.key] = Number(input.value);
+        else next[def.key] = String(input.value);
+        pushProps(item.id, next);
+        setStatus("已应用属性：" + (def.text || def.key));
+      };
+      row.append(name, input);
+      propsHost.append(row);
+    }
   }
 
   /* ---- filtering (mirrors library-state.mjs; the Node side re-clamps anyway) ---- */
@@ -330,6 +464,7 @@ const expression = `(() => {
       else clearHover();
     }
     syncControls();
+    renderProps();
   }
 
   function syncControls() {
@@ -430,6 +565,17 @@ const expression = `(() => {
   tMode.onchange = () => { state.library.transition.mode = tMode.value; save(); };
   tDir.onchange = () => { state.library.transition.dir = tDir.value; save(); };
   tSpeed.onchange = () => { state.library.transition.speed = tSpeed.value; save(); };
+  audioOn.onchange = () => {
+    if (!state.library.video || typeof state.library.video !== "object") state.library.video = { audio: false, volume: 70 };
+    state.library.video.audio = !!audioOn.checked;
+    save();
+    setStatus(audioOn.checked ? "已请求开启视频声音（若浏览器拦截，请点击一次页面）" : "视频声音已关闭");
+  };
+  audioVol.oninput = () => {
+    if (!state.library.video || typeof state.library.video !== "object") state.library.video = { audio: false, volume: 70 };
+    state.library.video.volume = Math.max(0, Math.min(100, Math.round(Number(audioVol.value) || 0)));
+    save();
+  };
 
   /* ---- mirror from the watchdog ---- */
   function absorbMirror(raw) {
@@ -437,13 +583,16 @@ const expression = `(() => {
     try { payload = JSON.parse(raw); } catch { return; }
     if (!payload || !payload.library) return;
     if (payload.items) {
-      state.items = payload.items.map(item => ({ id: item.id, title: item.title, kind: item.kind, quality: item.quality, renderMode: item.renderMode, custom: item.custom, tag: item.tag, hidden: item.hidden }));
+      state.items = payload.items.map(item => ({ id: item.id, title: item.title, kind: item.kind, quality: item.quality, renderMode: item.renderMode, custom: item.custom, properties: item.properties || [], tag: item.tag, hidden: item.hidden }));
     }
     /* A mirror that arrives right after a local save carries the same state; a
        stale one must not overwrite what the user is still editing. */
     if (Date.now() - localSaveAt > 1200) {
       state.library = payload.library;
       state.rotation = payload.rotation || null;
+      const video = state.library.video || { audio: false, volume: 70 };
+      audioOn.checked = !!video.audio;
+      audioVol.value = String(Number(video.volume) || 0);
       render(true);
       if (payload.rotation && payload.rotation.enabled) {
         const secs = payload.rotation.nextInSec;

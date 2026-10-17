@@ -186,6 +186,98 @@ async function verifyPicker(page, restoreSource, restoreMode) {
   return { ok: true, detail: `${opened.rows} rows listed, click applied ${opened.pick.id}, panel closes again` };
 }
 
+/* Phase 4: the appearance panel is a separate shadow-DOM surface. These three
+   checks assert structure and computed state only - no screenshots - so they
+   stay stable across theme changes. */
+async function verifyAppearancePanel(page) {
+  const prepared = await page.evaluate(`(() => {
+    const host = document.getElementById("codex-appearance-panel");
+    if (!host || !host.shadowRoot) return null;
+    const panel = host.shadowRoot.getElementById("panel");
+    const button = host.shadowRoot.getElementById("chip");
+    const close = host.shadowRoot.getElementById("close");
+    if (!panel || !button || !close) return null;
+    if (panel.classList.contains("open")) close.click();
+    return { display: getComputedStyle(panel).display };
+  })()`);
+  if (!prepared) return { ok: false, detail: "appearance panel not injected" };
+  await sleep(200);
+  const chip = await page.evaluate(`(() => {
+    const host = document.getElementById("codex-appearance-panel");
+    const button = host.shadowRoot.getElementById("chip");
+    const panel = host.shadowRoot.getElementById("panel");
+    const rect = button.getBoundingClientRect();
+    return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, display: getComputedStyle(panel).display };
+  })()`);
+  if (chip.display !== "none") return { ok: false, detail: `appearance panel should start closed, display=${chip.display}` };
+  await clickPoint(page, chip.x, chip.y);
+  await sleep(400);
+  const opened = await page.evaluate(`(() => {
+    const host = document.getElementById("codex-appearance-panel");
+    const panel = host.shadowRoot.getElementById("panel");
+    const close = host.shadowRoot.getElementById("close").getBoundingClientRect();
+    return { open: panel.classList.contains("open"), display: getComputedStyle(panel).display, closeX: close.x + close.width / 2, closeY: close.y + close.height / 2, sections: host.shadowRoot.querySelectorAll("details").length };
+  })()`);
+  await clickPoint(page, opened.closeX, opened.closeY);
+  await sleep(300);
+  const closed = await page.evaluate(`!document.getElementById("codex-appearance-panel").shadowRoot.getElementById("panel").classList.contains("open")`);
+  const ok = opened.open && opened.display !== "none" && closed && opened.sections >= 5;
+  return { ok, detail: `open=${opened.open} display=${opened.display} sections=${opened.sections} closeWorks=${closed}` };
+}
+
+async function verifyGlassToggle(page) {
+  const result = await page.evaluate(`(() => {
+    const host = document.getElementById("codex-appearance-panel");
+    const root = host && host.shadowRoot;
+    const api = window.__lunaAppearance;
+    if (!root || !api || typeof api.status !== "function") return null;
+    /* The glass switch is a <button class="toggle"> row, not an input. */
+    const button = [...root.querySelectorAll("button.toggle")].find(node => {
+      const text = (node.textContent || "").trim();
+      return text.indexOf("启用玻璃") === 0 || (text.indexOf("玻璃") >= 0 && text.indexOf("·") >= 0 && text.indexOf("透明") < 0);
+    });
+    if (!button) return null;
+    const before = api.status().glass;
+    button.click();
+    const after = api.status().glass;
+    /* The sheet only exists while glass is on, so sample it before restoring. */
+    const sheet = !!document.getElementById("codex-glass-style");
+    button.click();
+    const restored = api.status().glass;
+    return { before, after, restored, sheet };
+  })()`);
+  if (!result) return { ok: false, detail: "glass toggle not found in the appearance panel" };
+  const ok = result.after !== result.before && result.restored === result.before && result.sheet;
+  return { ok, detail: `glass ${result.before} -> ${result.after} -> ${result.restored}, sheet=${result.sheet}` };
+}
+
+async function verifyTransitionSwitch(page) {
+  const before = (await json(`${BASE}/status`)).library.transition.mode;
+  const target = await page.evaluate(`(() => {
+    const host = document.getElementById("codex-wallpaper-picker");
+    const select = host && host.shadowRoot ? host.shadowRoot.querySelector(".tmode") : null;
+    if (!select) return "";
+    const next = select.value === "zoom" ? "iris" : "zoom";
+    select.value = next;
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    return next;
+  })()`);
+  await sleep(1200);
+  const after = (await json(`${BASE}/status`)).library.transition.mode;
+  await page.evaluate(`(() => {
+    const host = document.getElementById("codex-wallpaper-picker");
+    const select = host && host.shadowRoot ? host.shadowRoot.querySelector(".tmode") : null;
+    if (!select) return false;
+    select.value = ${JSON.stringify(before)};
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  })()`);
+  await sleep(1200);
+  const restored = (await json(`${BASE}/status`)).library.transition.mode;
+  const ok = !!target && after === target && restored === before;
+  return { ok, detail: `transition ${before} -> ${after} -> ${restored}` };
+}
+
 async function main() {
   let health;
   try { health = await json(`${BASE}/health`); } catch (error) { console.error(`selftest: watchdog unreachable on ${BASE} (${error.message})`); process.exit(1); }
@@ -236,6 +328,19 @@ async function main() {
   console.log(`  ${picker.ok ? "OK" : "FAIL"}  ${picker.detail}`);
   if (picker.ok) passCount++;
   else failures.push(`picker: ${picker.detail}`);
+
+  console.log("\nselftest: appearance UI + transitions");
+  const appearanceChecks = [
+    ["appearance", await verifyAppearancePanel(page)],
+    ["glass", await verifyGlassToggle(page)],
+    ["transition", await verifyTransitionSwitch(page)],
+  ];
+  for (const [id, outcome] of appearanceChecks) {
+    rows.push({ id, mode: "ui", load: "-", detail: outcome.detail, seconds: 0, ok: outcome.ok });
+    console.log(`  ${outcome.ok ? "OK" : "FAIL"}  ${id}: ${outcome.detail}`);
+    if (outcome.ok) passCount++;
+    else failures.push(`${id}: ${outcome.detail}`);
+  }
 
 
   page.close();

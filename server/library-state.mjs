@@ -8,7 +8,7 @@
    junk into the picker or the rotation timer. */
 
 export const CONTENT_TAGS = ["safe", "suggestive", "nsfw"];
-export const TYPE_KEYS = ["scene", "video", "image"];
+export const TYPE_KEYS = ["scene", "video", "image", "web"];
 export const TRANSITION_MODES = ["cut", "fade", "zoom", "push", "wipe", "iris", "bars"];
 export const TRANSITION_DIRS = ["left", "right", "up", "down"];
 export const TRANSITION_SPEEDS = ["fast", "normal", "slow"];
@@ -20,6 +20,11 @@ export const MAX_ROTATION_SEC = 86400;
 /* Upper bound on remembered ids so a runaway picker cannot grow prefs.json
    without limit. */
 const MAX_LIST = 2000;
+/* Per-wallpaper property values are user data, not code; bound both the number
+   of wallpapers and the keys per wallpaper so a hand-edited prefs.json stays
+   small and the panel never has to render an unbounded form. */
+const MAX_PROP_ENTRIES = 500;
+const MAX_PROP_KEYS = 32;
 
 const clampInt = (value, min, max, fallback) => {
   const number = Math.round(Number(value));
@@ -46,6 +51,10 @@ export function defaultLibrary() {
     filters: { types: [], tag: "all", showHidden: false },
     hidden: [],
     contentTags: {},
+    props: {},
+    /* Native video wallpapers start muted: Chromium refuses audible autoplay
+       without a user gesture, so sound is an explicit opt-in. */
+    video: { audio: false, volume: 70 },
     rotation: { enabled: false, intervalSec: 30, order: "sequential" },
     transition: { mode: "fade", dir: "left", speed: "normal" }
   };
@@ -58,6 +67,7 @@ export function normalizeLibrary(raw) {
   const filters = source.filters && typeof source.filters === "object" ? source.filters : {};
   const rotation = source.rotation && typeof source.rotation === "object" ? source.rotation : {};
   const transition = source.transition && typeof source.transition === "object" ? source.transition : {};
+  const video = source.video && typeof source.video === "object" && !Array.isArray(source.video) ? source.video : {};
 
   /* An empty type list means "all types"; keep the array form so the picker can
      remember an explicit multi-select once the user touches it. */
@@ -80,11 +90,39 @@ export function normalizeLibrary(raw) {
     }
   }
 
+  const props = {};
+  if (source.props && typeof source.props === "object" && !Array.isArray(source.props)) {
+    let count = 0;
+    for (const [id, values] of Object.entries(source.props)) {
+      if (count >= MAX_PROP_ENTRIES) break;
+      const key = String(id).trim();
+      if (!key || key.length > 120 || !values || typeof values !== "object" || Array.isArray(values)) continue;
+      const clean = {};
+      let keys = 0;
+      for (const [propKey, propValue] of Object.entries(values)) {
+        if (keys >= MAX_PROP_KEYS) break;
+        const name = String(propKey).trim();
+        if (!name || name.length > 80) continue;
+        if (typeof propValue === "string") clean[name] = propValue.slice(0, 500);
+        else if (typeof propValue === "number" && Number.isFinite(propValue)) clean[name] = propValue;
+        else if (typeof propValue === "boolean") clean[name] = propValue;
+        else continue;
+        keys++;
+      }
+      if (keys) { props[key] = clean; count++; }
+    }
+  }
+
   return {
     version: 1,
     filters: { types, tag, showHidden: filters.showHidden === true },
     hidden: uniqueIds(source.hidden),
     contentTags: tags,
+    props,
+    video: {
+      audio: video.audio === true,
+      volume: clampInt(video.volume, 0, 100, 70)
+    },
     rotation: {
       enabled: rotation.enabled === true,
       intervalSec: clampInt(rotation.intervalSec, MIN_ROTATION_SEC, MAX_ROTATION_SEC, 30),
@@ -132,8 +170,9 @@ export function libraryPayload(library, wallpapers, extra = {}) {
     title: item.title,
     kind: item.kind || "image",
     renderMode: item.renderMode,
-    quality: item.renderMode === "native" ? "原生高清" : item.renderMode === "webgl" ? "WebGL渲染" : "静态预览",
+    quality: item.renderMode === "native" ? "原生高清" : item.renderMode === "webgl" ? "WebGL渲染" : item.renderMode === "web" ? "网页壁纸" : "静态预览",
     custom: !!item.custom,
+    properties: Array.isArray(item.properties) ? item.properties : [],
     tag: tagOf(state, item.id),
     hidden: hidden.has(item.id)
   }));

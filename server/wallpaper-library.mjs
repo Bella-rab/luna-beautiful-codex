@@ -10,6 +10,89 @@ export const MEDIA_TYPES = new Map([
   [".webp", "image/webp"], [".avif", "image/avif"]
 ]);
 
+/* Wallpaper Engine web projects point project.json at an HTML entry (or declare
+   type "web"). Their relative resources are served through the watchdog's
+   /web/<id>/<path> route; the page itself cannot fetch that origin (CSP), so the
+   watchdog also inlines the entry into a sandboxed srcdoc iframe. */
+export const WEB_TYPES = new Map([
+  [".html", "text/html; charset=utf-8"], [".htm", "text/html; charset=utf-8"],
+  [".css", "text/css; charset=utf-8"], [".js", "text/javascript; charset=utf-8"],
+  [".mjs", "text/javascript; charset=utf-8"], [".json", "application/json; charset=utf-8"],
+  [".svg", "image/svg+xml"], [".png", "image/png"], [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"], [".gif", "image/gif"], [".webp", "image/webp"],
+  [".avif", "image/avif"], [".ico", "image/x-icon"], [".woff", "font/woff"],
+  [".woff2", "font/woff2"], [".ttf", "font/ttf"], [".otf", "font/otf"],
+  [".mp3", "audio/mpeg"], [".ogg", "audio/ogg"], [".wav", "audio/wav"],
+  [".mp4", "video/mp4"], [".webm", "video/webm"], [".txt", "text/plain; charset=utf-8"]
+]);
+
+const MAX_PROPERTIES = 32;
+
+/* A small, explicit subset of general.properties. Only types the panel can
+   actually render are exposed; unknown types are skipped rather than guessed. */
+export function parseWallpaperProperties(metadata) {
+  const raw = metadata && metadata.general && metadata.general.properties;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+  const out = [];
+  for (const [key, value] of Object.entries(raw)) {
+    if (out.length >= MAX_PROPERTIES) break;
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const declared = String(value.type || "").toLowerCase();
+    const type = declared || (String(key).toLowerCase() === "schemecolor" ? "color" : "");
+    if (!["bool", "color", "slider", "combo", "text"].includes(type)) continue;
+    const prop = {
+      key: String(key).slice(0, 80),
+      type,
+      text: String(value.text || key).slice(0, 120),
+      value: undefined
+    };
+    if (type === "bool") prop.value = value.value === true || value.value === "true";
+    else if (type === "slider") {
+      const min = Number(value.min);
+      const max = Number(value.max);
+      const step = Number(value.step);
+      const numeric = Number(value.value);
+      prop.min = Number.isFinite(min) ? min : 0;
+      prop.max = Number.isFinite(max) && max > prop.min ? max : 100;
+      prop.step = Number.isFinite(step) && step > 0 ? step : 1;
+      prop.value = Number.isFinite(numeric) ? Math.min(prop.max, Math.max(prop.min, numeric)) : prop.min;
+    } else if (type === "combo") {
+      const options = [];
+      if (Array.isArray(value.options)) {
+        for (const option of value.options.slice(0, 32)) {
+          if (option && typeof option === "object" && option.value !== undefined) {
+            options.push({ value: String(option.value).slice(0, 120), label: String(option.label ?? option.value).slice(0, 120) });
+          } else if (option !== undefined) {
+            options.push({ value: String(option).slice(0, 120), label: String(option).slice(0, 120) });
+          }
+        }
+      } else if (value.options && typeof value.options === "object") {
+        for (const [optionValue, optionLabel] of Object.entries(value.options).slice(0, 32)) {
+          options.push({ value: String(optionValue).slice(0, 120), label: String(optionLabel).slice(0, 120) });
+        }
+      }
+      if (!options.length) continue;
+      prop.options = options;
+      prop.value = String(value.value ?? options[0].value).slice(0, 120);
+      if (!options.some(option => option.value === prop.value)) prop.value = options[0].value;
+    } else if (type === "color") {
+      prop.value = typeof value.value === "string" ? value.value.slice(0, 80) : "#ffffff";
+    } else {
+      prop.value = typeof value.value === "string" ? value.value.slice(0, 500) : String(value.value ?? "");
+    }
+    out.push(prop);
+  }
+  return out;
+}
+
+/* Resolve a project-declared file without ever leaving the wallpaper folder. */
+function insideDir(directory, relative) {
+  if (!relative || typeof relative !== "string") return null;
+  const root = path.resolve(directory);
+  const target = path.resolve(root, relative.replace(/^[\\/]+/, ""));
+  return target === root || target.startsWith(root + path.sep) ? target : null;
+}
+
 /* Scanning the workshop is not free: it spawns reg.exe, stats every folder and
    - for Scene wallpapers - used to read every scene.pkg just to look for an
    embedded video. The watchdog re-scans on every selection, so both the scan
@@ -149,7 +232,7 @@ export function listWallpapers() {
           const candidate = path.join(directory, name);
           if (existsSync(candidate)) { preview = candidate; break; }
         }
-        const declared = metadata.file ? path.join(directory, metadata.file) : null;
+        const declared = metadata.file ? insideDir(directory, metadata.file) : null;
         const declaredExt = declared ? path.extname(declared).toLowerCase() : "";
         /* A declared media file always wins. Otherwise the folder is a Scene
            whenever scene.pkg exists - package name and casing of metadata.type
@@ -157,8 +240,14 @@ export function listWallpapers() {
            exact "scene" match sent Scene wallpapers into the blurry static
            preview(path). */
         const direct = declared && MEDIA_TYPES.has(declaredExt) && existsSync(declared) ? declared : null;
+        /* Web wallpapers declare type "web" (project.json -> file: index.html).
+           Treat an HTML entry as web even when the type field is missing, which
+           is common in hand-made projects. */
+        const webEntry = !direct && declared && WEB_TYPES.has(declaredExt) && [".html", ".htm"].includes(declaredExt) && existsSync(declared)
+          ? declared : null;
+        const webDir = webEntry ? path.dirname(webEntry) : null;
         let scene = null;
-        if (!direct) {
+        if (!direct && !webEntry) {
           if (declared && declaredExt === ".pkg" && existsSync(declared)) scene = declared;
           else {
             const sceneCandidate = path.join(directory, "scene.pkg");
@@ -169,18 +258,20 @@ export function listWallpapers() {
         let sceneVideo = null;
         if (scene) { try { sceneVideo = extractSceneVideo(scene); } catch {} }
 
-        if (!direct && !scene && !preview) continue;
+        if (!direct && !scene && !webEntry && !preview) continue;
         wallpapers.push({
           id, title: metadata.title || id,
-          type: metadata.type || (direct ? "video" : scene ? "scene" : "unknown"),
-          file: direct || sceneVideo || scene || preview,
+          type: metadata.type || (direct ? "video" : scene ? "scene" : webEntry ? "web" : "unknown"),
+          file: direct || webEntry || sceneVideo || scene || preview,
           preview, scene, direct, sceneVideo,
+          webEntry, webDir,
           sceneDir: scene ? path.dirname(scene) : null,
-          fallbackPreview: (!direct && !sceneVideo && preview) ? preview : null,
-          renderMode: direct ? "native" : scene ? "webgl" : preview ? "fallback" : "unknown",
+          fallbackPreview: (!direct && !webEntry && !sceneVideo && preview) ? preview : null,
+          renderMode: direct ? "native" : scene ? "webgl" : webEntry ? "web" : preview ? "fallback" : "unknown",
           /* "scene" means the wallpaper is a WebGL scene (even when this switch
              falls back to its preview), which is what the type filter offers. */
-          kind: scene ? "scene" : direct && MEDIA_TYPES.get(declaredExt).startsWith("video/") ? "video" : "image",
+          kind: scene ? "scene" : webEntry ? "web" : direct && MEDIA_TYPES.get(declaredExt).startsWith("video/") ? "video" : "image",
+          properties: parseWallpaperProperties(metadata),
           custom: false,
         });
       }
@@ -319,6 +410,7 @@ export function resolveWallpaperMedia(source) {
   if (item) {
     if (item.direct) return { path: item.direct, type: MEDIA_TYPES.get(path.extname(item.direct).toLowerCase()), wallpaper: item, renderMode: "native" };
     if (item.scene) return { wallpaper: item, renderMode: "webgl", scene: item.scene, sceneDir: item.sceneDir, fallbackVideo: item.sceneVideo, fallbackPreview: item.preview };
+    if (item.webEntry) return { wallpaper: item, renderMode: "web", webEntry: item.webEntry, webDir: item.webDir, fallbackVideo: item.sceneVideo, fallbackPreview: item.preview };
     if (item.fallbackPreview) return { path: item.fallbackPreview, type: MEDIA_TYPES.get(path.extname(item.fallbackPreview).toLowerCase()) || "image/gif", wallpaper: item, fallback: true, renderMode: "fallback" };
   }
   const filePath = path.resolve(source);
