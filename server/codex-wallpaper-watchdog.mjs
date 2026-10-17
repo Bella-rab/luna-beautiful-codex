@@ -4,6 +4,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { listWallpapers, resolveWallpaperMedia, invalidateWallpaperCache } from "./wallpaper-library.mjs";
+import { APPEARANCE_BUILD, normalizeAppearance, withFactoryPresets } from "./appearance.mjs";
 
 const root = import.meta.dirname;
 const stateRoot = path.join(process.env.APPDATA || os.homedir(), "Codex", "luna-beautiful-codex");
@@ -11,6 +12,7 @@ const selectionPath = path.join(stateRoot, "wallpaper-selection.json");
 const prefsPath = path.join(stateRoot, "prefs.json");
 const controlsScript = path.join(root, "inject-background-controls.mjs");
 const pickerScript = path.join(root, "inject-wallpaper-picker.mjs");
+const appearanceScript = path.join(root, "inject-appearance.mjs");
 const logPath = path.join(root, "codex-wallpaper-watchdog.log");
 const lockPort = 43310;
 const devtoolsPorts = [9229, 9230, 9231, 9232, 9233, 9234, 9235, 9236, 9237, 9238, 9239];
@@ -134,7 +136,10 @@ function selection() {
 }
 
 function prefs() {
-  return { whiteText: true, ...readJson(prefsPath, null) };
+  /* prefs() sits on the 800ms hot path, so the stored appearance object is handed back
+     untouched - writeAppearance() already clamped it before it was written. Anything that
+     needs the full shape reads appearanceState(). */
+  return { whiteText: true, appearance: null, ...readJson(prefsPath, null) };
 }
 
 function writePrefs(patch) {
@@ -142,6 +147,34 @@ function writePrefs(patch) {
   fs.mkdirSync(stateRoot, { recursive: true });
   fs.writeFileSync(prefsPath, JSON.stringify(next, null, 2));
   return next;
+}
+
+/* Phase 1 appearance state. The factory presets are always part of the list and every
+   field is clamped, so a hand-edited prefs.json can never push junk into a stylesheet. */
+function appearanceState() {
+  return withFactoryPresets(prefs().appearance);
+}
+
+function writeAppearance(raw) {
+  const appearance = withFactoryPresets(normalizeAppearance(raw));
+  writePrefs({ appearance });
+  return appearance;
+}
+
+/* The panel POSTs its state here. The body is only a few KB, but it is still bounded so
+   a stray request cannot buffer forever. */
+function readBody(request, limitBytes = 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    request.on("data", chunk => {
+      size += chunk.length;
+      if (size > limitBytes) { reject(new Error("body too large")); request.destroy(); return; }
+      chunks.push(chunk);
+    });
+    request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    request.on("error", reject);
+  });
 }
 
 /* Wallpaper metadata only. The bytes are no longer read up front: the page reads
@@ -160,7 +193,7 @@ function cors(res) {
 
 async function acquireServer() {
   return await new Promise((resolve, reject) => {
-    const server = http.createServer((req, res) => {
+    const server = http.createServer(async (req, res) => {
       cors(res);
       if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
       const url = new URL(req.url, "http://127.0.0.1");
@@ -192,10 +225,24 @@ async function acquireServer() {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({ ok: true, whiteText: next.whiteText }));
         } else if (url.pathname === "/prefs") {
-          res.writeHead(200, { "content-type": "application/json" });
-          res.end(JSON.stringify(prefs()));
+          if (req.method === "POST") {
+            let parsed = null;
+            try { parsed = JSON.parse((await readBody(req)) || "{}"); } catch { parsed = null; }
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+              res.writeHead(400, { "content-type": "application/json" });
+              res.end(JSON.stringify({ ok: false, error: "expected a JSON object body" }));
+            } else {
+              const appearance = writeAppearance(parsed.appearance === undefined ? parsed : parsed.appearance);
+              log("appearance prefs written via http (preset=" + appearance.activePreset + ")");
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(JSON.stringify({ ok: true, appearance }));
+            }
+          } else {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ...prefs(), appearance: appearanceState() }));
+          }
         } else if (url.pathname === "/status") {
-          const payload = { selection: selection(), prefs: prefs(), pid: process.pid, deferredUpgrade: lastDeferredUpgrade, quality: lastQuality, lastQualityEvent: lastQuality, qualitySettledForScene: [...qualitySceneStats].filter(([, v]) => v.settled).map(([id]) => id), contextRemounts, version: pluginVersion, pluginDir };
+          const payload = { selection: selection(), prefs: prefs(), appearance: appearanceState(), pid: process.pid, deferredUpgrade: lastDeferredUpgrade, quality: lastQuality, lastQualityEvent: lastQuality, qualitySettledForScene: [...qualitySceneStats].filter(([, v]) => v.settled).map(([id]) => id), contextRemounts, version: pluginVersion, pluginDir };
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify(payload));
         } else if (url.pathname.startsWith("/scene-fallback/")) {
@@ -306,6 +353,26 @@ async function status() {
       source: document.getElementById("codex-custom-background-media")?.getAttribute("data-wallpaper-source") || null,
       readability: !!document.getElementById("codex-background-readability"),
       controls: !!document.getElementById("codex-background-controls"),
+      appearance: !!document.getElementById("codex-appearance-panel"),
+      /* The panel node survives a code update, so the injected runtime carries its own
+         build id; a mismatch forces one re-injection instead of leaving the old page half
+         running against the new Node half. */
+      appearanceBuild: (() => {
+        try { const api = window.__lunaAppearance; return (api && api.status && api.status().build) || ""; } catch { return ""; }
+      })(),
+      /* The 外观 panel cannot fetch anything (CSP), so it leaves its saved state in a
+         dataset attribute; read-and-clear it here and persist it in the loop. */
+      appearanceCommand: (() => {
+        const host = document.getElementById("codex-appearance-panel");
+        const command = (host && host.dataset.prefsCommand) || "";
+        if (host) host.dataset.prefsCommand = "";
+        return command;
+      })(),
+      /* Bumped by the panel whenever it opens and wants the saved state mirrored back. */
+      appearanceRefresh: (() => {
+        const host = document.getElementById("codex-appearance-panel");
+        return (host && host.dataset.prefsRequest) || "";
+      })(),
       picker: !!document.getElementById("codex-wallpaper-picker"),
       whiteText: !!document.getElementById("codex-force-white-style"),
       deferredUpgrade: (() => { const v = window.__codexDeferredWebGL || null; if (v) { const d = window.__codexDeferredDiag || ""; window.__codexDeferredWebGL = null; window.__codexDeferredDiag = null; return { result: v, lastDiag: d }; } return null; })(),
@@ -1262,6 +1329,7 @@ function nextTick(delayMs = IDLE_TICK_MS) {
 }
 let controlsRunning = false;
 let pickerRunning = false;
+let appearanceRunning = false;
 function launchControls() {
   controlsRunning = true;
   const child = spawn(process.execPath, [controlsScript], { windowsHide: true, cwd: root, stdio: "ignore" });
@@ -1274,6 +1342,12 @@ function launchPicker() {
   child.once("error", error => { pickerRunning = false; log(`picker error: ${error.message}`); });
   child.once("exit", code => { pickerRunning = false; log(code === 0 ? "wallpaper picker restored" : `picker exited ${code}`); });
 }
+function launchAppearance() {
+  appearanceRunning = true;
+  const child = spawn(process.execPath, [appearanceScript], { windowsHide: true, cwd: root, stdio: "ignore" });
+  child.once("error", error => { appearanceRunning = false; log(`appearance error: ${error.message}`); });
+  child.once("exit", code => { appearanceRunning = false; log(code === 0 ? "appearance panel restored" : `appearance exited ${code}`); });
+}
 
 try {
   await acquireServer();
@@ -1284,6 +1358,7 @@ try {
 log(`watchdog started pid=${process.pid}`);
 let lastWhite = null;
 let lastPickerOpen = false;
+let lastAppearanceRefresh = "";
 let prewarm = null;
 let prewarmEpoch = 0;
 let prewarmBusy = false;
@@ -1408,6 +1483,19 @@ for (;;) {
       lastPickerOpen = !!state.pickerOpen;
       if (lastPickerOpen) { invalidateWallpaperCache(); mediaCache.clear(); prewarmSizes.clear(); log("picker opened: wallpaper library cache invalidated"); }
     }
+    if (state.page && state.appearanceCommand) {
+      try {
+        const parsed = JSON.parse(state.appearanceCommand);
+        const saved = writeAppearance(parsed && parsed.appearance !== undefined ? parsed.appearance : parsed);
+        log(`appearance prefs saved via panel (preset=${saved.activePreset}, glass=${saved.glass.enabled})`);
+      } catch (error) { log(`appearance command rejected: ${error.message}`); }
+    }
+    if (state.page && state.appearanceRefresh !== lastAppearanceRefresh) {
+      lastAppearanceRefresh = state.appearanceRefresh || "";
+      /* Mirror the saved state back so the panel can honour "read on open". */
+      const mirror = JSON.stringify({ t: Date.now(), appearance: appearanceState() });
+      try { await command("Runtime.evaluate", { expression: `(() => { const host = document.getElementById("codex-appearance-panel"); if (!host) return false; host.dataset.prefs = ${JSON.stringify(mirror)}; return true; })()`, returnByValue: true }); } catch {}
+    }
     if (state.page && preference.whiteText && !state.whiteText && lastWhite !== true) { await applyWhiteText(); lastWhite = true; }
     else if (state.page && !preference.whiteText && state.whiteText && lastWhite !== false) { await removeWhiteText(); lastWhite = false; }
     else if (!state.page) { lastWhite = null; }
@@ -1525,12 +1613,14 @@ for (;;) {
     const needsBackground = state.page && !prewarmCommitted && (contextRecovery || !state.background || !state.base || state.source !== current.source);
     const needsControls = state.page && (!state.readability || !state.controls);
     const needsPicker = state.page && !state.picker;
-    if (!restoring && (needsBackground || (needsControls && !controlsRunning) || (needsPicker && !pickerRunning))) {
+    const needsAppearance = state.page && (!state.appearance || state.appearanceBuild !== APPEARANCE_BUILD);
+    if (!restoring && (needsBackground || (needsControls && !controlsRunning) || (needsPicker && !pickerRunning) || (needsAppearance && !appearanceRunning))) {
       restoring = true;
       const installSafety = setTimeout(() => { if (restoring) { log(`install forced-reset (over 180s): ${current.source}`); restoring = false; } }, 180000);
       try {
         if (needsBackground) { const bgResult = await installBackground(current); if (bgResult && bgResult.renderMode === "aborted") log(`install aborted (superseded): ${current.source}`); else log(`background installed: ${current.source}`); }
         if (needsBackground || needsControls) launchControls();
+        if (needsAppearance) launchAppearance();
         if (needsPicker) launchPicker();
       } catch (error) { log(`restore error: ${error.message}`); mediaCache.delete(current.source); }
       finally { clearTimeout(installSafety); restoring = false; }
