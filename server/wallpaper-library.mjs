@@ -23,8 +23,15 @@ const sceneVideoMemo = new Map();
 export function invalidateWallpaperCache() {
   cachedWallpapers = null;
   cachedListedAt = 0;
-  cachedLibraries = null;
-  sceneVideoMemo.clear();
+  /* Keep cachedLibraries: re-probing means three reg.exe spawns plus a stat on
+     every drive letter, which is slow under a sandboxed host and does not help
+     find a newly installed wallpaper - the workshop directory listing below is
+     what picks those up. A new Steam library is still found on restart/TTL. */
+  /* Keep sceneVideoMemo: it is keyed by (path, mtimeMs, size), so a replaced
+     scene.pkg invalidates itself and a newly installed one simply misses. Clearing
+     it here made every picker open re-read every package (18 scenes, ~500MB) to
+     look for an embedded video, which stalled the first pick by ~2 seconds. */
+  if (sceneVideoMemo.size > 96) sceneVideoMemo.clear();
 }
 
 function reg(key, value) {
@@ -184,6 +191,9 @@ export function listWallpapers() {
     const dir = uploadsDir();
     if (existsSync(dir)) {
       for (const name of readdirSync(dir)) {
+        /* Appearance uploads (avatar_/mascot_) live in the same folder but are not
+           wallpapers; without this skip they would show up in the picker. */
+        if (name.startsWith("avatar_") || name.startsWith("mascot_")) continue;
         const filePath = path.join(dir, name);
         const ext = path.extname(name).toLowerCase();
         const mime = MEDIA_TYPES.get(ext);
@@ -244,6 +254,9 @@ export function extractSceneVideo(scenePath) {
   if (memo && memo.mtimeMs === stat.mtimeMs && memo.size === stat.size) return memo.result;
   const result = extractSceneVideoUncached(scenePath);
   sceneVideoMemo.set(scenePath, { mtimeMs: stat.mtimeMs, size: stat.size, result });
+  /* Workshop libraries rarely exceed a few hundred entries; bound the memo anyway
+     so a long-running watchdog cannot grow it without limit. */
+  if (sceneVideoMemo.size > 256) sceneVideoMemo.delete(sceneVideoMemo.keys().next().value);
   return result;
 }
 

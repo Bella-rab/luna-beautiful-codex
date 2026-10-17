@@ -14,6 +14,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { EXT_BUILD, extRuntime } from "./ext.mjs";
 
 export const APPEARANCE_VERSION = 1;
 
@@ -49,6 +50,24 @@ export function extraSelectorList(text) {
 }
 
 export const OBJECT_FITS = ["cover", "contain", "fill"];
+export const EXT_FORMS = ["whale", "cat", "rabbit", "fox", "penguin", "robot"];
+export const CLICK_STYLES = ["ripple", "spark", "ring"];
+export const TRAIL_STYLES = ["comet", "line", "dots"];
+export const BLEND_MODES = ["screen", "normal", "overlay"];
+export const COLOR_MODES = ["single", "rainbow"];
+export function defaultExt() {
+  return {
+    version: 1,
+    enabled: false,
+    fx: {
+      click: { enabled: false, style: "ripple", size: 96, glow: 60, colorMode: "single", color: "#7dd3fc", opacity: 80, blend: "screen" },
+      trail: { enabled: false, style: "comet", length: 240, width: 3, glow: 60, colorMode: "single", color: "#a78bfa", opacity: 70, blend: "screen" }
+    },
+    parallax: { enabled: false, bg: 1, ui: 1, mascot: 1, smooth: 60, depths: { chat: 1, composer: 1, sidebar: 1, bubble: 1 } },
+    avatar: { enabled: false, size: 40, radius: 50, file: "", image: "" },
+    mascot: { enabled: false, form: "whale", scale: 1, x: 96, y: 92, drag: true, file: "", image: "" }
+  };
+}
 export function defaultAppearance() {
   return {
     version: APPEARANCE_VERSION,
@@ -110,6 +129,7 @@ export function defaultAppearance() {
       positionY: 50,
       scale: 100
     },
+    ext: defaultExt(),
     presets: []
   };
 }
@@ -203,6 +223,52 @@ export function normalizeAppearance(raw, options = {}) {
   outFilters.positionY = num(filters.positionY, 0, 100, outFilters.positionY);
   outFilters.scale = num(filters.scale, 100, 200, outFilters.scale);
 
+  const extRaw = isObject(raw.ext) ? raw.ext : {};
+  const clampPick = (value, list, fallback) => (list.includes(value) ? value : fallback);
+  out.ext.enabled = extRaw.enabled === true;
+  const fxRaw = isObject(extRaw.fx) ? extRaw.fx : {};
+  const clickRaw = isObject(fxRaw.click) ? fxRaw.click : {};
+  out.ext.fx.click.enabled = clickRaw.enabled === true;
+  out.ext.fx.click.style = clampPick(clickRaw.style, CLICK_STYLES, out.ext.fx.click.style);
+  out.ext.fx.click.size = num(clickRaw.size, 40, 240, out.ext.fx.click.size);
+  out.ext.fx.click.glow = num(clickRaw.glow, 0, 100, out.ext.fx.click.glow);
+  out.ext.fx.click.colorMode = clampPick(clickRaw.colorMode, COLOR_MODES, out.ext.fx.click.colorMode);
+  out.ext.fx.click.color = color(clickRaw.color, out.ext.fx.click.color);
+  out.ext.fx.click.opacity = num(clickRaw.opacity, 0, 100, out.ext.fx.click.opacity);
+  out.ext.fx.click.blend = clampPick(clickRaw.blend, BLEND_MODES, out.ext.fx.click.blend);
+  const trailRaw = isObject(fxRaw.trail) ? fxRaw.trail : {};
+  out.ext.fx.trail.enabled = trailRaw.enabled === true;
+  out.ext.fx.trail.style = clampPick(trailRaw.style, TRAIL_STYLES, out.ext.fx.trail.style);
+  out.ext.fx.trail.length = num(trailRaw.length, 80, 800, out.ext.fx.trail.length);
+  out.ext.fx.trail.width = num(trailRaw.width, 1, 10, out.ext.fx.trail.width);
+  out.ext.fx.trail.glow = num(trailRaw.glow, 0, 100, out.ext.fx.trail.glow);
+  out.ext.fx.trail.colorMode = clampPick(trailRaw.colorMode, COLOR_MODES, out.ext.fx.trail.colorMode);
+  out.ext.fx.trail.color = color(trailRaw.color, out.ext.fx.trail.color);
+  out.ext.fx.trail.opacity = num(trailRaw.opacity, 0, 100, out.ext.fx.trail.opacity);
+  out.ext.fx.trail.blend = clampPick(trailRaw.blend, BLEND_MODES, out.ext.fx.trail.blend);
+  const parallaxRaw = isObject(extRaw.parallax) ? extRaw.parallax : {};
+  out.ext.parallax.enabled = parallaxRaw.enabled === true;
+  out.ext.parallax.bg = num(parallaxRaw.bg, 0, 3, out.ext.parallax.bg);
+  out.ext.parallax.ui = num(parallaxRaw.ui, 0, 3, out.ext.parallax.ui);
+  out.ext.parallax.mascot = num(parallaxRaw.mascot, 0, 3, out.ext.parallax.mascot);
+  out.ext.parallax.smooth = num(parallaxRaw.smooth, 0, 100, out.ext.parallax.smooth);
+  const depthsRaw = isObject(parallaxRaw.depths) ? parallaxRaw.depths : {};
+  for (const key of ["chat", "composer", "sidebar", "bubble"]) out.ext.parallax.depths[key] = num(depthsRaw[key], 0, 3, out.ext.parallax.depths[key]);
+  const avatarRaw = isObject(extRaw.avatar) ? extRaw.avatar : {};
+  out.ext.avatar.enabled = avatarRaw.enabled === true;
+  out.ext.avatar.size = num(avatarRaw.size, 24, 72, out.ext.avatar.size);
+  out.ext.avatar.radius = num(avatarRaw.radius, 0, 100, out.ext.avatar.radius);
+  out.ext.avatar.file = text(avatarRaw.file).trim().slice(0, 120);
+  out.ext.avatar.image = /^data:image\/(png|jpeg|webp);base64,/.test(text(avatarRaw.image)) ? text(avatarRaw.image) : "";
+  const mascotRaw = isObject(extRaw.mascot) ? extRaw.mascot : {};
+  out.ext.mascot.enabled = mascotRaw.enabled === true;
+  out.ext.mascot.form = clampPick(mascotRaw.form, EXT_FORMS, out.ext.mascot.form);
+  out.ext.mascot.scale = num(mascotRaw.scale, 0.6, 1.4, out.ext.mascot.scale);
+  out.ext.mascot.x = num(mascotRaw.x, 0, 100, out.ext.mascot.x);
+  out.ext.mascot.y = num(mascotRaw.y, 0, 100, out.ext.mascot.y);
+  out.ext.mascot.drag = mascotRaw.drag !== false;
+  out.ext.mascot.file = text(mascotRaw.file).trim().slice(0, 120);
+  out.ext.mascot.image = /^data:image\/(png|jpeg|webp);base64,/.test(text(mascotRaw.image)) ? text(mascotRaw.image) : "";
   out.activePreset = text(raw.activePreset).trim() ? text(raw.activePreset).trim().slice(0, 48) : out.activePreset;
   if (options.withPresets !== false) {
     const list = Array.isArray(raw.presets) ? raw.presets : [];
@@ -334,10 +400,41 @@ export function appearancePrefsPath(env = process.env) {
   return path.join(stateRoot(env), "prefs.json");
 }
 
+const imageCache = new Map();
+/* Uploaded avatar/mascot images live as files under uploads/; the page cannot read a
+   path (CSP + no file access), so the Node half inlines them as data URLs for the
+   handful of kilobytes a UI image needs. Cached by (path, mtime, size). */
+export function hydrateExtImages(appearance, env = process.env) {
+  const ext = appearance && appearance.ext;
+  if (!ext) return appearance;
+  for (const kind of ["avatar", "mascot"]) {
+    const slot = ext[kind];
+    if (!slot) continue;
+    slot.image = "";
+    const name = path.basename(String(slot.file || ""));
+    if (!name) continue;
+    const full = path.join(stateRoot(env), "uploads", name);
+    try {
+      const stat = fs.statSync(full);
+      if (!stat.isFile() || stat.size <= 0 || stat.size > 3 * 1024 * 1024) continue;
+      const key = full + ":" + stat.mtimeMs + ":" + stat.size;
+      let data = imageCache.get(key);
+      if (!data) {
+        const extName = path.extname(full).toLowerCase();
+        const mime = extName === ".png" ? "image/png" : extName === ".webp" ? "image/webp" : "image/jpeg";
+        data = "data:" + mime + ";base64," + fs.readFileSync(full).toString("base64");
+        imageCache.set(key, data);
+        if (imageCache.size > 6) imageCache.delete(imageCache.keys().next().value);
+      }
+      slot.image = data;
+    } catch (error) {}
+  }
+  return appearance;
+}
 export function readAppearancePrefs(env = process.env) {
   try {
     const stored = JSON.parse(fs.readFileSync(appearancePrefsPath(env), "utf8"));
-    return withFactoryPresets(stored && stored.appearance);
+    return hydrateExtImages(withFactoryPresets(stored && stored.appearance), env);
   } catch {
     return withFactoryPresets(null);
   }
@@ -346,7 +443,7 @@ export function readAppearancePrefs(env = process.env) {
    page latched on window.__lunaAppearance and re-injects on a mismatch, which is what
    makes a watchdog restart after a code update take effect on a page that is already
    running an older runtime (the panel node alone cannot tell the two apart). */
-export const APPEARANCE_BUILD = "phase2+2026.10.17.1";
+export const APPEARANCE_BUILD = "phase3+2026.10.18.1";
 const BUILD_TOKEN = "__LUNA_APPEARANCE_BUILD__";
 
 /* The page-side half. It is serialised with Function.prototype.toString() and evaluated
@@ -363,6 +460,11 @@ function pageRuntime() {
   const OBJECT_FITS = ["cover", "contain", "fill"];
   const MAX_EXTRA_SELECTORS = 8;
   const MAX_EXTRA_SELECTOR_LENGTH = 120;
+  const EXT_FORMS = ["whale", "cat", "rabbit", "fox", "penguin", "robot"];
+  const CLICK_STYLES = ["ripple", "spark", "ring"];
+  const TRAIL_STYLES = ["comet", "line", "dots"];
+  const BLEND_MODES = ["screen", "normal", "overlay"];
+  const COLOR_MODES = ["single", "rainbow"];
   const HOST_ID = "codex-appearance-panel";
 
   /* Selectors verified against the running Codex DOM. Every face keeps fallbacks and a
@@ -712,6 +814,7 @@ function pageRuntime() {
     markFaces();
     applyFraming(state);
     applyShade(state);
+    try { if (window.__lunaExt) window.__lunaExt.apply(state.ext || null); } catch (error) { log("error", "ext apply failed: " + (error && error.message)); }
     return {
       ok: true,
       glass: !!state.glass.enabled,
@@ -731,6 +834,8 @@ function pageRuntime() {
       markTimer = null;
       if (!state) return;
       try { markFaces(); applyFraming(state); } catch (error) { log("error", "mark failed: " + (error && error.message)); }
+      /* A wallpaper switch creates a fresh base layer; parallax has to rebind to it. */
+      try { if (state.ext && state.ext.parallax && state.ext.parallax.enabled && window.__lunaExt) window.__lunaExt.refresh(); } catch (error) {}
     }, 120);
   };
 
@@ -909,6 +1014,21 @@ function pageRuntime() {
     syncers.push(() => { select.value = String(getPath(state, path) || ""); });
     return select;
   };
+  const selectLabeled = (parent, path, label, options, labels) => {
+    const row = el("div", "row");
+    const lab = el("label");
+    lab.append(document.createTextNode(label));
+    const select = bind(el("select"), path);
+    for (const value of options) {
+      const option = el("option", null, (labels && labels[value]) || value);
+      option.value = value;
+      select.append(option);
+    }
+    row.append(lab, select);
+    parent.append(row);
+    syncers.push(() => { select.value = String(getPath(state, path) || ""); });
+    return select;
+  };
   const toggleRow = (parent, path, label) => {
     const row = el("div", "row");
     const button = bind(el("button", "toggle"), path);
@@ -962,10 +1082,18 @@ function pageRuntime() {
      CSP baseline untouched and the watchdog picks the command up on its next status tick
      (120ms while the picker is open, 800ms idle). The local apply already happened, so
      the tick latency is invisible. */
+  const persistable = () => {
+    const copy = JSON.parse(JSON.stringify(state));
+    if (copy.ext) {
+      if (copy.ext.avatar) copy.ext.avatar.image = "";
+      if (copy.ext.mascot) copy.ext.mascot.image = "";
+    }
+    return copy;
+  };
   const queueSave = () => {
     const node = host();
     if (!node || !state) return;
-    try { node.dataset.prefsCommand = JSON.stringify({ appearance: state }); } catch {}
+    try { node.dataset.prefsCommand = JSON.stringify({ appearance: persistable() }); } catch {}
   };
   let saveTimer = null;
   const debouncedSave = () => {
@@ -1328,6 +1456,122 @@ function pageRuntime() {
     rangeRow(wrap, "filters.scale", "缩放", 100, 200, 1, "%");
     wrap.append(el("div", "hint", "滤镜走 CSS filter（GPU 合成），取景对原生视频用 object-fit/object-position、对 WebGL 画布用 transform；新旧背景层会带上同一套参数，切换时不会跳变。"));
   };
+  /* ---------- Phase 3: 扩展特效 ---------- */
+  const EXT_FORM_LABELS = { whale: "鲸鱼", cat: "猫", rabbit: "兔", fox: "狐狸", penguin: "企鹅", robot: "机器人" };
+  const CLICK_LABELS = { ripple: "涟漪", spark: "火花", ring: "圆环" };
+  const TRAIL_LABELS = { comet: "彗尾", line: "细线", dots: "点阵" };
+  const BLEND_LABELS = { screen: "滤色 screen", normal: "正常 normal", overlay: "叠加 overlay" };
+  const COLOR_LABELS = { single: "单色", rainbow: "彩虹" };
+  const DEPTH_LABELS = [["chat", "对话滚动区"], ["composer", "输入区"], ["sidebar", "侧栏"], ["bubble", "消息气泡"]];
+
+  /* Image inputs never read a path in the page (CSP and no filesystem access). The File
+     object is parked on window.__lunaUpload; the watchdog streams it out in 2MB slices
+     and mirrors the saved data URL back through data-prefs. */
+  const imagePicker = (parent, kind, label) => {
+    const row = el("div", "row");
+    const lab = el("label");
+    lab.append(document.createTextNode(label));
+    const input = el("input");
+    input.type = "file";
+    input.accept = "image/png,image/jpeg,image/webp";
+    const clear = el("button", "toggle", "清除图片");
+    const line = el("div", "grid2");
+    line.append(input, clear);
+    row.append(lab, line);
+    parent.append(row);
+    input.addEventListener("change", () => {
+      const file = input.files && input.files[0];
+      input.value = "";
+      if (!file) return;
+      if (file.size > 3 * 1024 * 1024) { say("图片不能超过 3MB。", true); return; }
+      const hostNode = host();
+      if (!hostNode) { say("外观面板宿主不存在。", true); return; }
+      window.__lunaUpload = { file };
+      try { hostNode.dataset.imageCommand = JSON.stringify({ kind, name: file.name, size: file.size }); } catch {}
+      say("已提交" + label + "：" + file.name + "（保存后自动生效）");
+    });
+    clear.addEventListener("click", () => {
+      const hostNode = host();
+      if (!hostNode) return;
+      try { hostNode.dataset.imageCommand = JSON.stringify({ kind, clear: true }); } catch {}
+      say("已请求清除" + label + "。");
+    });
+    syncers.push(() => {
+      const slot = state.ext && state.ext[kind] ? state.ext[kind] : {};
+      clear.classList.toggle("on", !!(slot.file || slot.image));
+      clear.textContent = slot.file ? "清除图片（" + slot.file + "）" : "清除图片";
+    });
+    return { input, clear };
+  };
+
+  const renderExt = body => {
+    const wrap = section(body, "扩展特效（点击 / 拖尾 / 视差 / 头像 / 吉祥物）", false);
+    toggleRow(wrap, "ext.enabled", "扩展总开关");
+    wrap.append(el("div", "hint", "总开关关闭时所有特效层都不创建；特效层 pointer-events:none，不会拦截任何原生点击。"));
+
+    const click = el("div", "face");
+    click.append(el("div", "name", "点击特效"));
+    toggleRow(click, "ext.fx.click.enabled", "启用点击特效");
+    selectLabeled(click, "ext.fx.click.style", "样式", CLICK_STYLES, CLICK_LABELS);
+    rangeRow(click, "ext.fx.click.size", "尺寸", 40, 240, 1, "px");
+    rangeRow(click, "ext.fx.click.glow", "光晕", 0, 100, 1, "%");
+    selectLabeled(click, "ext.fx.click.colorMode", "配色", COLOR_MODES, COLOR_LABELS);
+    colorRow(click, "ext.fx.click.color", "单色颜色");
+    rangeRow(click, "ext.fx.click.opacity", "不透明度", 0, 100, 1, "%");
+    selectLabeled(click, "ext.fx.click.blend", "混合模式", BLEND_MODES, BLEND_LABELS);
+    wrap.append(click);
+
+    const trail = el("div", "face");
+    trail.append(el("div", "name", "拖尾特效"));
+    toggleRow(trail, "ext.fx.trail.enabled", "启用拖尾特效");
+    selectLabeled(trail, "ext.fx.trail.style", "样式", TRAIL_STYLES, TRAIL_LABELS);
+    rangeRow(trail, "ext.fx.trail.length", "拖尾长度", 80, 800, 10, "px");
+    rangeRow(trail, "ext.fx.trail.width", "线宽", 1, 10, 0.5, "px");
+    rangeRow(trail, "ext.fx.trail.glow", "光晕", 0, 100, 1, "%");
+    selectLabeled(trail, "ext.fx.trail.colorMode", "配色", COLOR_MODES, COLOR_LABELS);
+    colorRow(trail, "ext.fx.trail.color", "单色颜色");
+    rangeRow(trail, "ext.fx.trail.opacity", "不透明度", 0, 100, 1, "%");
+    selectLabeled(trail, "ext.fx.trail.blend", "混合模式", BLEND_MODES, BLEND_LABELS);
+    wrap.append(trail);
+
+    const parallax = el("div", "face");
+    parallax.append(el("div", "name", "视差（默认关闭）"));
+    toggleRow(parallax, "ext.parallax.enabled", "启用视差");
+    rangeRow(parallax, "ext.parallax.bg", "背景层倍率", 0, 3, 0.1, "");
+    rangeRow(parallax, "ext.parallax.ui", "UI 总倍率", 0, 3, 0.1, "");
+    rangeRow(parallax, "ext.parallax.mascot", "吉祥物倍率", 0, 3, 0.1, "");
+    rangeRow(parallax, "ext.parallax.smooth", "平滑度", 0, 100, 1, "%");
+    for (const pair of DEPTH_LABELS) rangeRow(parallax, "ext.parallax.depths." + pair[0], "分区深度 · " + pair[1], 0, 3, 0.1, "");
+    parallax.append(el("div", "note", "视差只写 translate，不改变布局；滚动与输入时不重排。"));
+    wrap.append(parallax);
+
+    const avatar = el("div", "face");
+    avatar.append(el("div", "name", "会话头像（默认关闭）"));
+    toggleRow(avatar, "ext.avatar.enabled", "启用会话头像");
+    rangeRow(avatar, "ext.avatar.size", "尺寸", 24, 72, 1, "px");
+    rangeRow(avatar, "ext.avatar.radius", "圆角", 0, 100, 1, "%");
+    imagePicker(avatar, "avatar", "头像图片");
+    const avatarState = el("div", "note", "定位中…");
+    avatar.append(avatarState);
+    syncers.push(() => {
+      let count = 0;
+      try { count = window.__lunaExt && window.__lunaExt.stats ? Number(window.__lunaExt.stats().avatarNodes) || 0 : 0; } catch { count = 0; }
+      avatarState.textContent = count > 0 ? "已定位 " + count + " 个用户消息" : "未定位：当前会话还没有用户消息气泡（不可用/未定位）。";
+    });
+    wrap.append(avatar);
+
+    const mascot = el("div", "face");
+    mascot.append(el("div", "name", "吉祥物（默认关闭）"));
+    toggleRow(mascot, "ext.mascot.enabled", "启用吉祥物");
+    selectLabeled(mascot, "ext.mascot.form", "形象", EXT_FORMS, EXT_FORM_LABELS);
+    rangeRow(mascot, "ext.mascot.scale", "大小", 0.6, 1.4, 0.05, "");
+    rangeRow(mascot, "ext.mascot.x", "水平位置", 0, 100, 1, "%");
+    rangeRow(mascot, "ext.mascot.y", "垂直位置", 0, 100, 1, "%");
+    toggleRow(mascot, "ext.mascot.drag", "允许拖动");
+    imagePicker(mascot, "mascot", "自定义立绘");
+    mascot.append(el("div", "note", "拖动移动（位置自动保存）；点击开合壁纸选择器。只有吉祥物自身接收指针事件。"));
+    wrap.append(mascot);
+  };
   /* The page keeps its own copy of the model so an imported preset can be validated
      before it ever reaches the stylesheet. It mirrors the Node-side normaliser. */
   const normalize = (raw, options) => {
@@ -1365,6 +1609,17 @@ function pageRuntime() {
         ui: { sendButton: "", link: "", fileIcon: "", tab: "", reasoning: "" }
       },
       filters: { blur: 0, brightness: 100, contrast: 100, saturate: 100, opacity: 100, darken: 0, objectFit: "cover", positionX: 50, positionY: 50, scale: 100 },
+      ext: {
+        version: 1,
+        enabled: false,
+        fx: {
+          click: { enabled: false, style: "ripple", size: 96, glow: 60, colorMode: "single", color: "#7dd3fc", opacity: 80, blend: "screen" },
+          trail: { enabled: false, style: "comet", length: 240, width: 3, glow: 60, colorMode: "single", color: "#a78bfa", opacity: 70, blend: "screen" }
+        },
+        parallax: { enabled: false, bg: 1, ui: 1, mascot: 1, smooth: 60, depths: { chat: 1, composer: 1, sidebar: 1, bubble: 1 } },
+        avatar: { enabled: false, size: 40, radius: 50, file: "", image: "" },
+        mascot: { enabled: false, form: "whale", scale: 1, x: 96, y: 92, drag: true, file: "", image: "" }
+      },
       presets: []
     };
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
@@ -1432,6 +1687,55 @@ function pageRuntime() {
     out.filters.positionX = num(filters.positionX, 0, 100, out.filters.positionX);
     out.filters.positionY = num(filters.positionY, 0, 100, out.filters.positionY);
     out.filters.scale = num(filters.scale, 100, 200, out.filters.scale);
+    /* Phase 3 extension block: same clamps as the Node-side normaliser, so a preset
+       imported in the page and one persisted by the watchdog round-trip identically. */
+    const extRaw = raw.ext && typeof raw.ext === "object" ? raw.ext : {};
+    const pick = (value, list, fallback) => (list.indexOf(value) >= 0 ? value : fallback);
+    const str = value => (typeof value === "string" ? value.trim() : "");
+    out.ext.enabled = extRaw.enabled === true;
+    const fxRaw = extRaw.fx && typeof extRaw.fx === "object" ? extRaw.fx : {};
+    const clickRaw = fxRaw.click && typeof fxRaw.click === "object" ? fxRaw.click : {};
+    out.ext.fx.click.enabled = clickRaw.enabled === true;
+    out.ext.fx.click.style = pick(clickRaw.style, CLICK_STYLES, out.ext.fx.click.style);
+    out.ext.fx.click.size = num(clickRaw.size, 40, 240, out.ext.fx.click.size);
+    out.ext.fx.click.glow = num(clickRaw.glow, 0, 100, out.ext.fx.click.glow);
+    out.ext.fx.click.colorMode = pick(clickRaw.colorMode, COLOR_MODES, out.ext.fx.click.colorMode);
+    out.ext.fx.click.color = color(clickRaw.color, out.ext.fx.click.color);
+    out.ext.fx.click.opacity = num(clickRaw.opacity, 0, 100, out.ext.fx.click.opacity);
+    out.ext.fx.click.blend = pick(clickRaw.blend, BLEND_MODES, out.ext.fx.click.blend);
+    const trailRaw = fxRaw.trail && typeof fxRaw.trail === "object" ? fxRaw.trail : {};
+    out.ext.fx.trail.enabled = trailRaw.enabled === true;
+    out.ext.fx.trail.style = pick(trailRaw.style, TRAIL_STYLES, out.ext.fx.trail.style);
+    out.ext.fx.trail.length = num(trailRaw.length, 80, 800, out.ext.fx.trail.length);
+    out.ext.fx.trail.width = num(trailRaw.width, 1, 10, out.ext.fx.trail.width);
+    out.ext.fx.trail.glow = num(trailRaw.glow, 0, 100, out.ext.fx.trail.glow);
+    out.ext.fx.trail.colorMode = pick(trailRaw.colorMode, COLOR_MODES, out.ext.fx.trail.colorMode);
+    out.ext.fx.trail.color = color(trailRaw.color, out.ext.fx.trail.color);
+    out.ext.fx.trail.opacity = num(trailRaw.opacity, 0, 100, out.ext.fx.trail.opacity);
+    out.ext.fx.trail.blend = pick(trailRaw.blend, BLEND_MODES, out.ext.fx.trail.blend);
+    const parallaxRaw = extRaw.parallax && typeof extRaw.parallax === "object" ? extRaw.parallax : {};
+    out.ext.parallax.enabled = parallaxRaw.enabled === true;
+    out.ext.parallax.bg = num(parallaxRaw.bg, 0, 3, out.ext.parallax.bg);
+    out.ext.parallax.ui = num(parallaxRaw.ui, 0, 3, out.ext.parallax.ui);
+    out.ext.parallax.mascot = num(parallaxRaw.mascot, 0, 3, out.ext.parallax.mascot);
+    out.ext.parallax.smooth = num(parallaxRaw.smooth, 0, 100, out.ext.parallax.smooth);
+    const depthsRaw = parallaxRaw.depths && typeof parallaxRaw.depths === "object" ? parallaxRaw.depths : {};
+    for (const key of ["chat", "composer", "sidebar", "bubble"]) out.ext.parallax.depths[key] = num(depthsRaw[key], 0, 3, out.ext.parallax.depths[key]);
+    const avatarRaw = extRaw.avatar && typeof extRaw.avatar === "object" ? extRaw.avatar : {};
+    out.ext.avatar.enabled = avatarRaw.enabled === true;
+    out.ext.avatar.size = num(avatarRaw.size, 24, 72, out.ext.avatar.size);
+    out.ext.avatar.radius = num(avatarRaw.radius, 0, 100, out.ext.avatar.radius);
+    out.ext.avatar.file = str(avatarRaw.file).slice(0, 120);
+    out.ext.avatar.image = /^data:image\/(png|jpeg|webp);base64,/.test(str(avatarRaw.image)) ? str(avatarRaw.image) : "";
+    const mascotRaw = extRaw.mascot && typeof extRaw.mascot === "object" ? extRaw.mascot : {};
+    out.ext.mascot.enabled = mascotRaw.enabled === true;
+    out.ext.mascot.form = pick(mascotRaw.form, EXT_FORMS, out.ext.mascot.form);
+    out.ext.mascot.scale = num(mascotRaw.scale, 0.6, 1.4, out.ext.mascot.scale);
+    out.ext.mascot.x = num(mascotRaw.x, 0, 100, out.ext.mascot.x);
+    out.ext.mascot.y = num(mascotRaw.y, 0, 100, out.ext.mascot.y);
+    out.ext.mascot.drag = mascotRaw.drag !== false;
+    out.ext.mascot.file = str(mascotRaw.file).slice(0, 120);
+    out.ext.mascot.image = /^data:image\/(png|jpeg|webp);base64,/.test(str(mascotRaw.image)) ? str(mascotRaw.image) : "";
     if (withPresets) {
       const list = Array.isArray(raw.presets) ? raw.presets : [];
       for (const entry of list) {
@@ -1462,6 +1766,20 @@ function pageRuntime() {
     renderGlass(body);
     renderFonts(body);
     renderFilters(body);
+    renderExt(body);
+    /* The mascot lives in the page runtime; a drag hands its new position back so the
+       panel persists it through the same debounced save as every slider. */
+    try {
+      if (window.__lunaExt && window.__lunaExt.setPersist) {
+        window.__lunaExt.setPersist(next => {
+          if (!state || !state.ext || !state.ext.mascot || !next) return;
+          state.ext.mascot.x = Number(next.x);
+          state.ext.mascot.y = Number(next.y);
+          syncersRun();
+          debouncedSave();
+        });
+      }
+    } catch {}
     syncersRun();
 
     let open = false;
@@ -1543,7 +1861,21 @@ function pageRuntime() {
     });
     node.__lunaPrefsObserver.observe(node, { attributes: true, attributeFilter: ["data-prefs"] });
 
-    return { ok: true, open: false, sections: ["preset", "glass", "fonts", "filters"], fields: syncers.length + subSyncers.length };
+    /* Upload progress comes back on a separate attribute so it never collides with
+       the appearance mirror. */
+    if (node.__lunaImageObserver) { try { node.__lunaImageObserver.disconnect(); } catch {} }
+    node.__lunaImageObserver = new MutationObserver(() => {
+      const raw = node.dataset.imageStatus;
+      if (!raw) return;
+      let payload = null;
+      try { payload = JSON.parse(raw); } catch { return; }
+      if (!payload) return;
+      node.dataset.imageStatus = "";
+      say(String(payload.message || (payload.state === "done" ? "已保存" : "处理中")), payload.state === "error");
+    });
+    node.__lunaImageObserver.observe(node, { attributes: true, attributeFilter: ["data-image-status"] });
+
+    return { ok: true, open: false, sections: ["preset", "glass", "fonts", "filters", "ext"], fields: syncers.length + subSyncers.length };
   };
 
   return {
@@ -1573,4 +1905,5 @@ function pageRuntime() {
   };
 }
 
-export const PANEL_RUNTIME_SOURCE = "(" + pageRuntime.toString().replace(BUILD_TOKEN, APPEARANCE_BUILD) + ")()";
+const EXT_RUNTIME_SOURCE = "(" + extRuntime.toString().replace("__LUNA_EXT_BUILD__", EXT_BUILD) + ")()";
+export const PANEL_RUNTIME_SOURCE = "(() => { window.__lunaExt = " + EXT_RUNTIME_SOURCE + "; return (" + pageRuntime.toString().replace(BUILD_TOKEN, APPEARANCE_BUILD) + ")(); })()";

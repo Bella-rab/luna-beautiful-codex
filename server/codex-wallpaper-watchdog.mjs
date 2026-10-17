@@ -4,7 +4,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { listWallpapers, resolveWallpaperMedia, invalidateWallpaperCache, uploadsDir } from "./wallpaper-library.mjs";
-import { APPEARANCE_BUILD, normalizeAppearance, withFactoryPresets } from "./appearance.mjs";
+import { APPEARANCE_BUILD, hydrateExtImages, normalizeAppearance, withFactoryPresets } from "./appearance.mjs";
 import { TRANSITION_MS, filterWallpapers, libraryPayload, normalizeLibrary, tagOf } from "./library-state.mjs";
 
 const root = import.meta.dirname;
@@ -79,6 +79,11 @@ const PREWARM_CLICK_WAIT_MS = 600;
    instead of waited for. */
 const PREWARM_READY_WINDOW_MS = 900;
 const IDLE_TICK_MS = 800;
+/* After the picker closes (or right after a pick) keep a short fast window: a pick
+   made from a hotkey/launcher is detected within ~200ms instead of waiting for the
+   idle 800ms tick, while a genuinely idle page still polls slowly. */
+const RECENT_TICK_MS = 200;
+const RECENT_WINDOW_MS = 10000;
 /* Phase 2 rotation. A prewarmed switch is preferred but bounded: past this the
    rotation installs directly, so a slow scene can never stall the timer. */
 const ROTATION_PREWARM_WAIT_MS = 2500;
@@ -158,11 +163,17 @@ function writePrefs(patch) {
 /* Phase 1 appearance state. The factory presets are always part of the list and every
    field is clamped, so a hand-edited prefs.json can never push junk into a stylesheet. */
 function appearanceState() {
-  return withFactoryPresets(prefs().appearance);
+  /* Hydration inlines uploads/avatar_* and uploads/mascot_* as data URLs for the
+     page; the stored prefs only ever keep the bare file name. */
+  return hydrateExtImages(withFactoryPresets(prefs().appearance));
 }
 
 function writeAppearance(raw) {
   const appearance = withFactoryPresets(normalizeAppearance(raw));
+  /* Uploads are files, never prefs payload: drop any inlined data URL before the
+     JSON lands on disk, otherwise a 3MB image would be rewritten every save. */
+  if (appearance.ext && appearance.ext.avatar) appearance.ext.avatar.image = "";
+  if (appearance.ext && appearance.ext.mascot) appearance.ext.mascot.image = "";
   writePrefs({ appearance });
   return appearance;
 }
@@ -478,6 +489,14 @@ async function status() {
         const picker = document.getElementById("codex-wallpaper-picker");
         const value = (picker && picker.dataset.uploadDelete) || "";
         if (picker) picker.dataset.uploadDelete = "";
+        return value;
+      })(),
+      /* Phase 3: avatar/mascot image hand-off. The panel parks the File on
+         window.__lunaUpload and leaves {kind,name,size} (or {kind,clear}) here. */
+      imageReady: (() => {
+        const host = document.getElementById("codex-appearance-panel");
+        const value = (host && host.dataset.imageCommand) || "";
+        if (host) host.dataset.imageCommand = "";
         return value;
       })(),
       whiteText: !!document.getElementById("codex-force-white-style"),
@@ -1481,6 +1500,9 @@ let lastRotationSwitchAt = 0;
 const rotationFailed = new Map();
 let lastLibraryRequest = "";
 let libraryMirrorPending = false;
+let appearanceMirrorPending = false;
+let lastHoverCommand = "";
+let recentInteractionAt = 0;
 let glassEconomy = null;
 let lastEconomyPush = "";
 let economyLowStreak = 0;
@@ -1735,13 +1757,99 @@ async function handleUpload(raw) {
     await pageCommand('(() => { try { window.__lunaUpload = null; } catch {} return true; })()');
   }
 }
+/* Avatar/mascot images: much smaller than a wallpaper, same page-side hand-off.
+   The file lands in uploads/ with a typed prefix so the wallpaper library can skip
+   it (see wallpaper-library.mjs) and prefs only stores the basename. */
+const IMAGE_KINDS = new Set(["avatar", "mascot"]);
+const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
+const IMAGE_MAX_BYTES = 3 * 1024 * 1024;
+
+async function imageReport(state, message) {
+  const payload = JSON.stringify(JSON.stringify({ state, message: message || "", t: Date.now() }));
+  await pageCommand('(() => { const host = document.getElementById("codex-appearance-panel"); if (!host) return false; host.dataset.imageStatus = ' + payload + '; return true; })()');
+}
+
+async function handleImageUpload(raw) {
+  if (uploadRun) { log("image upload ignored: another upload is still running"); return; }
+  let cmd = null;
+  try { cmd = JSON.parse(raw); } catch { return; }
+  const kind = String((cmd && cmd.kind) || "");
+  if (!IMAGE_KINDS.has(kind)) { await imageReport("error", "未知图片类型"); return; }
+  const current = appearanceState();
+  current.ext.avatar.image = "";
+  current.ext.mascot.image = "";
+  if (cmd && cmd.clear === true) {
+    current.ext[kind].file = "";
+    current.ext[kind].image = "";
+    writeAppearance(current);
+    appearanceMirrorPending = true;
+    log("appearance " + kind + " image cleared");
+    await imageReport("done", "已清除");
+    return;
+  }
+  const name = String((cmd && cmd.name) || "").trim();
+  const size = Number((cmd && cmd.size) || 0);
+  const ext = path.extname(name).toLowerCase();
+  if (!name || !IMAGE_EXTENSIONS.has(ext)) { log("image upload rejected: unsupported file " + (name || "(unnamed)")); await imageReport("error", "仅支持 PNG/JPG/WEBP"); return; }
+  if (!(size > 0) || size > IMAGE_MAX_BYTES) { log("image upload rejected: bad size " + size); await imageReport("error", "图片为空或超过 3MB"); return; }
+
+  uploadRun = { name, size, done: 0, image: true };
+  let dest = null;
+  try {
+    const dir = uploadsDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const base = kind + "_" + Date.now() + (ext === ".jpeg" ? ".jpg" : ext);
+    dest = path.join(dir, base);
+    const fd = fs.openSync(dest, "w");
+    try {
+      for (let offset = 0; offset < size; offset += UPLOAD_CHUNK_BYTES) {
+        const end = Math.min(size, offset + UPLOAD_CHUNK_BYTES);
+        const expression = '(async () => {' +
+          ' const up = window.__lunaUpload;' +
+          ' if (!up || !up.file) return null;' +
+          ' const buffer = await up.file.slice(' + offset + ', ' + end + ').arrayBuffer();' +
+          ' const bytes = new Uint8Array(buffer);' +
+          ' if (typeof bytes.toBase64 === "function") return bytes.toBase64();' +
+          ' let binary = "";' +
+          ' for (let index = 0; index < bytes.length; index += 8192) binary += String.fromCharCode.apply(null, bytes.subarray(index, index + 8192));' +
+          ' return btoa(binary);' +
+          ' })()';
+        const b64 = await pageCommand(expression, 60000);
+        if (!b64) throw new Error("page lost the image file");
+        fs.writeSync(fd, Buffer.from(b64, "base64"));
+      }
+    } finally { fs.closeSync(fd); }
+    current.ext[kind].file = path.basename(dest);
+    current.ext[kind].image = "";
+    writeAppearance(current);
+    appearanceMirrorPending = true;
+    log("appearance " + kind + " image saved: " + path.basename(dest) + " (" + (size / 1024).toFixed(0) + "KB)");
+    await imageReport("done", "已保存 " + path.basename(dest));
+  } catch (error) {
+    if (dest) { try { fs.unlinkSync(dest); } catch {} }
+    log("image upload failed: " + error.message);
+    await imageReport("error", error.message);
+  } finally {
+    uploadRun = null;
+    await pageCommand('(() => { try { window.__lunaUpload = null; } catch {} return true; })()');
+  }
+}
+
 for (;;) {
   let tickDelay = IDLE_TICK_MS;
   try {
     let current = selection();
     const preference = prefs();
     const state = await status();
-    if (state && state.page) tickDelay = state.pickerOpen ? PREWARM_TICK_MS : IDLE_TICK_MS;
+    const pickerVisibilityChanged = !!(state && state.pickerOpen) !== lastPickerOpen;
+    const hoverCommand = (state && state.hoverCommand) || "";
+    const hoverChanged = !!hoverCommand && hoverCommand !== lastHoverCommand;
+    if (state && state.page && (state.pickerCommand || pickerVisibilityChanged || hoverChanged)) recentInteractionAt = Date.now();
+    lastHoverCommand = hoverCommand;
+    if (state && state.page) {
+      const recent = Date.now() - recentInteractionAt < RECENT_WINDOW_MS;
+      tickDelay = state.pickerOpen ? PREWARM_TICK_MS : recent ? RECENT_TICK_MS : IDLE_TICK_MS;
+    }
     let pickerPicked = "";
     if (state.page && state.pickerCommand && /^\d+$/.test(state.pickerCommand)) {
       const wallpaper = listWallpapers().find(item => item.id === state.pickerCommand);
@@ -1755,6 +1863,7 @@ for (;;) {
       lastPickerOpen = !!state.pickerOpen;
       if (lastPickerOpen) { invalidateWallpaperCache(); mediaCache.clear(); prewarmSizes.clear(); log("picker opened: wallpaper library cache invalidated"); }
     }
+    if (state.page && state.imageReady) await handleImageUpload(state.imageReady);
     if (state.page && state.appearanceCommand) {
       try {
         const parsed = JSON.parse(state.appearanceCommand);
@@ -1762,9 +1871,11 @@ for (;;) {
         log(`appearance prefs saved via panel (preset=${saved.activePreset}, glass=${saved.glass.enabled})`);
       } catch (error) { log(`appearance command rejected: ${error.message}`); }
     }
-    if (state.page && state.appearanceRefresh !== lastAppearanceRefresh) {
+    if (state.page && (state.appearanceRefresh !== lastAppearanceRefresh || appearanceMirrorPending)) {
       lastAppearanceRefresh = state.appearanceRefresh || "";
-      /* Mirror the saved state back so the panel can honour "read on open". */
+      appearanceMirrorPending = false;
+      /* Mirror the saved state back so the panel can honour "read on open" and a
+         freshly uploaded avatar/mascot shows up without a reload. */
       const mirror = JSON.stringify({ t: Date.now(), appearance: appearanceState() });
       await pageCommand(`(() => { const host = document.getElementById("codex-appearance-panel"); if (!host) return false; host.dataset.prefs = ${JSON.stringify(mirror)}; return true; })()`);
     }
