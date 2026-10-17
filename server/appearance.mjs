@@ -346,7 +346,7 @@ export function readAppearancePrefs(env = process.env) {
    page latched on window.__lunaAppearance and re-injects on a mismatch, which is what
    makes a watchdog restart after a code update take effect on a page that is already
    running an older runtime (the panel node alone cannot tell the two apart). */
-export const APPEARANCE_BUILD = "phase1+2026.10.16.1";
+export const APPEARANCE_BUILD = "phase2+2026.10.17.1";
 const BUILD_TOKEN = "__LUNA_APPEARANCE_BUILD__";
 
 /* The page-side half. It is serialised with Function.prototype.toString() and evaluated
@@ -357,7 +357,7 @@ const BUILD_TOKEN = "__LUNA_APPEARANCE_BUILD__";
 function pageRuntime() {
   const BUILD = "__LUNA_APPEARANCE_BUILD__";
   const FACE_ORDER = ["sidebar", "sidebarContent", "settingsWindow", "conversation", "thinkingTrigger", "floaters"];
-  const FACE_LABELS = { sidebar: "左侧栏", sidebarContent: "侧栏内容区", settingsWindow: "设置窗", conversation: "对话区", thinkingTrigger: "思考区", floaters: "浮层" };
+  const FACE_LABELS = { sidebar: "左侧栏", sidebarContent: "侧栏内容区", settingsWindow: "设置窗（原生窗口）", conversation: "对话区", thinkingTrigger: "思考区", floaters: "浮层（按需）" };
   const FACE_MODES = ["inherit", "custom", "off"];
   const FACE_MODE_LABELS = { inherit: "跟随全局", custom: "独立", off: "关闭" };
   const OBJECT_FITS = ["cover", "contain", "fill"];
@@ -373,7 +373,7 @@ function pageRuntime() {
     settingsWindow: ["[role=dialog][data-state=open]", "[aria-modal=true]", "[class*=_SettingsWindow_]", "[class*=_SettingsView_]", "[role=dialog]"],
     conversation: ["main[class*=_MainContentSurface_]", "main"],
     thinkingTrigger: [".thread-scroll-container [class*=\"group/activity-header\"]", "[data-markdown-text-style=reasoning]", "[class*=_Reasoning_]"],
-    floaters: ["[data-radix-popper-content-wrapper]", "[role=menu][data-state=open]", "[role=listbox]", "[role=tooltip]"]
+    floaters: ["[role=menu][data-state=open]", "[data-radix-popper-content-wrapper] [role=menu]", "[role=listbox][data-state=open]", "[role=tooltip][data-state=open]", "[data-radix-popper-content-wrapper]"]
   };
   const ROLE_SELECTORS = {
     secondary: ["aside.app-shell-left-panel [data-app-action-sidebar-thread-title]", "[data-assistant-message-sent-time]", "[class*=_ComposerFooterLabel_]"],
@@ -403,6 +403,26 @@ function pageRuntime() {
   const clamp = (value, lo, hi) => {
     const parsed = Number(value);
     return Number.isFinite(parsed) ? Math.min(hi, Math.max(lo, parsed)) : lo;
+  };
+  /* Glass economy is pushed by the watchdog through data-economy when a heavy
+     WebGL scene cannot hold the frame budget with a viewport-sized blur. */
+  const economyOn = () => {
+    try { return document.getElementById(HOST_ID)?.dataset.economy === "1"; } catch { return false; }
+  };
+  /* Overlay menus/tooltips exist in the DOM permanently but stay display:none, so
+     the floaters face must only bind to a node that is actually on screen. */
+  const firstVisibleMatch = list => {
+    for (const selector of list) {
+      let nodes = [];
+      try { nodes = document.querySelectorAll(selector); } catch { continue; }
+      for (const node of nodes) {
+        try {
+          const style = getComputedStyle(node);
+          if (style.display !== "none" && style.visibility !== "hidden" && node.getClientRects().length) return node;
+        } catch {}
+      }
+    }
+    return null;
   };
   const firstMatch = list => {
     for (const selector of list) {
@@ -496,12 +516,19 @@ function pageRuntime() {
       const alpha = clamp(useOwn ? own.alpha : glass.alpha, 0, 100);
       const base = dark ? glass.colorDark : glass.colorLight;
       const color = useOwn ? (own.color || base) : base;
+      /* Economy mode (heavy WebGL scene) drops only the conversation backdrop blur:
+         that surface is viewport-sized and owns almost all of the compositor cost,
+         while tint/border/radius keep the glass visibly on. */
       const declarations = [
-        "background:" + rgba(color, alpha / 100) + " !important",
-        "backdrop-filter:blur(" + blur + "px) saturate(" + saturation + ") !important",
-        "-webkit-backdrop-filter:blur(" + blur + "px) saturate(" + saturation + ") !important",
-        "border:1px solid rgba(" + borderChannel + "," + borderAlpha + ") !important"
+        "background:" + rgba(color, alpha / 100) + " !important"
       ];
+      if (!(economyOn() && face === "conversation")) {
+        declarations.push(
+          "backdrop-filter:blur(" + blur + "px) saturate(" + saturation + ") !important",
+          "-webkit-backdrop-filter:blur(" + blur + "px) saturate(" + saturation + ") !important"
+        );
+      }
+      declarations.push("border:1px solid rgba(" + borderChannel + "," + borderAlpha + ") !important");
       if (face === "sidebar") {
         const radius = clamp(glass.sidebarRadius, 0, 40);
         const corners = [
@@ -657,7 +684,7 @@ function pageRuntime() {
       const mode = (glass.faces || {})[face] || "inherit";
       const active = !!glass.enabled && mode !== "off";
       const previous = markedFaces.get(face);
-      const node = active ? firstMatch(FACE_SELECTORS[face]) : null;
+      const node = active ? (face === "floaters" ? firstVisibleMatch(FACE_SELECTORS[face]) : firstMatch(FACE_SELECTORS[face])) : null;
       if (previous && previous !== node) {
         markedFaces.delete(face);
         try { if (previous.getAttribute("data-codex-glass") === face) previous.removeAttribute("data-codex-glass"); } catch {}
@@ -690,7 +717,8 @@ function pageRuntime() {
       glass: !!state.glass.enabled,
       faces: FACE_ORDER.filter(face => document.querySelector("[data-codex-glass=\"" + face + "\"]")),
       extraSelectors: extraSelectors(state.glass.extraSelectors).length,
-      shade: Number(shadeAlpha(state).toFixed(3))
+      shade: Number(shadeAlpha(state).toFixed(3)),
+      economy: economyOn()
     };
   };
 
@@ -751,6 +779,7 @@ function pageRuntime() {
     ".face .name{font:600 12px/1.2 inherit;color:#dce7f6}",
     ".face .custom{display:grid;grid-template-columns:1fr 1fr 44px;gap:6px;margin-top:6px;align-items:center}",
     ".face .custom.idle{opacity:.35}",
+    ".note{margin-top:4px;font:500 10.5px/1.35 inherit;color:#8fa3bd}",
     ".face input[type=range]{width:100%;height:22px;accent-color:#38bdf8}",
     ".face input[type=color]{width:100%;height:22px;padding:0;border:1px solid rgba(255,255,255,.18);border-radius:6px;background:transparent}",
     ".face select{width:100%;padding:5px 6px;border:1px solid rgba(255,255,255,.18);border-radius:8px;background:rgba(255,255,255,.06);color:#f4f7ff;font:500 12px/1.2 inherit}",
@@ -1108,6 +1137,10 @@ function pageRuntime() {
       }
       line.append(select);
       box.append(line);
+      /* Codex's settings window is a native Electron window, not page DOM, and the
+         floaters only exist while a menu is open - say so instead of failing quietly. */
+      if (face === "settingsWindow") box.append(el("div", "note", "不可用：Codex 设置窗是原生窗口，页面内无对应 DOM。"));
+      if (face === "floaters") box.append(el("div", "note", "按需生效：仅当菜单/下拉/提示实际打开时套用玻璃。"));
       const custom = el("div", "custom");
       const blur = bind(el("input"), "glass.face." + face + ".blur");
       blur.type = "range";
@@ -1518,6 +1551,9 @@ function pageRuntime() {
     mountPanel,
     normalize,
     watch,
+    /* Re-run the current state (the watchdog pushes data-economy after a frame-rate
+       decision and needs the glass sheet rebuilt without touching saved prefs). */
+    refresh: () => (state ? apply(state) : { ok: false, error: "no appearance state" }),
     state: () => state,
     faces: FACE_ORDER,
     status: () => ({
@@ -1530,6 +1566,7 @@ function pageRuntime() {
       extraSelectors: state ? extraSelectors(state.glass.extraSelectors) : [],
       shade: state ? Number(shadeAlpha(state).toFixed(3)) : 0,
       styles: ["codex-glass-style", "codex-font-style", "codex-filter-style"].filter(id => !!document.getElementById(id)),
+      economy: economyOn(),
       panel: !!document.getElementById(HOST_ID)
     }),
     events: () => (window.__codexAppearanceLog || []).slice()

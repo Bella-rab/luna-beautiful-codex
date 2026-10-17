@@ -102,6 +102,24 @@ function resolveCacheDir() {
   return null;
 }
 
+/* User-added wallpapers live beside prefs.json. The page hands the bytes over
+   through the watchdog (it can never read a path itself), and the copy keeps its
+   extension with a timestamp prefix so two uploads of "wall.jpg" cannot collide. */
+export function uploadsDir() {
+  const base = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+  return path.join(base, "Codex", "luna-beautiful-codex", "uploads");
+}
+
+/* "1737142200000_my wallpaper.jpg" -> { id: "up_1737142200000_my wallpaper", title: "my wallpaper" } */
+function uploadEntry(filePath) {
+  const base = path.basename(filePath);
+  const ext = path.extname(base);
+  const stem = base.slice(0, base.length - ext.length);
+  const id = "up_" + stem;
+  const title = stem.replace(/^[0-9]{10,}_/, "").replace(/[_]+/g, " ").trim() || stem;
+  return { id, title };
+}
+
 export function listWallpapers() {
   const now = Date.now();
   if (cachedWallpapers && now - cachedListedAt < LIST_TTL_MS) return cachedWallpapers;
@@ -153,11 +171,49 @@ export function listWallpapers() {
           sceneDir: scene ? path.dirname(scene) : null,
           fallbackPreview: (!direct && !sceneVideo && preview) ? preview : null,
           renderMode: direct ? "native" : scene ? "webgl" : preview ? "fallback" : "unknown",
+          /* "scene" means the wallpaper is a WebGL scene (even when this switch
+             falls back to its preview), which is what the type filter offers. */
+          kind: scene ? "scene" : direct && MEDIA_TYPES.get(declaredExt).startsWith("video/") ? "video" : "image",
+          custom: false,
         });
       }
     } catch {}
   }
-  cachedWallpapers = wallpapers.sort((a, b) => a.title.localeCompare(b.title, "zh-Hans-CN"));
+  /* Custom uploads last, so the workshop library keeps its familiar order. */
+  try {
+    const dir = uploadsDir();
+    if (existsSync(dir)) {
+      for (const name of readdirSync(dir)) {
+        const filePath = path.join(dir, name);
+        const ext = path.extname(name).toLowerCase();
+        const mime = MEDIA_TYPES.get(ext);
+        if (!mime) continue;
+        let stat; try { stat = statSync(filePath); } catch { continue; }
+        if (!stat.isFile() || stat.size < 1) continue;
+        const { id, title } = uploadEntry(filePath);
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const isVideo = mime.startsWith("video/");
+        wallpapers.push({
+          id, title, type: isVideo ? "video" : "image",
+          file: filePath, preview: isVideo ? null : filePath,
+          scene: null, direct: filePath, sceneVideo: null, sceneDir: null,
+          fallbackPreview: null,
+          renderMode: "native",
+          kind: isVideo ? "video" : "image",
+          custom: true,
+          addedAt: Math.round(stat.mtimeMs)
+        });
+      }
+    }
+  } catch {}
+
+  cachedWallpapers = wallpapers.sort((a, b) => {
+    /* Uploads stay at the end of the list regardless of title ordering. */
+    if (!!a.custom !== !!b.custom) return a.custom ? 1 : -1;
+    if (a.custom && b.custom) return (a.addedAt || 0) - (b.addedAt || 0);
+    return a.title.localeCompare(b.title, "zh-Hans-CN");
+  });
   cachedListedAt = Date.now();
   return cachedWallpapers;
 }

@@ -157,7 +157,8 @@ async function verifyPicker(page, restoreSource, restoreMode) {
       pick: rect ? { id: row.querySelector(".id").textContent.trim(), x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 } : null
     };
   })()`);
-  if (opened.display !== "block") return { ok: false, detail: `panel stayed hidden after clicking 壁纸 (computed display=${opened.display})` };
+  /* Phase 2 turned the panel into a flex column; any visible display is fine. */
+  if (opened.display === "none") return { ok: false, detail: `panel stayed hidden after clicking 壁纸 (computed display=${opened.display})` };
   if (!opened.pick) return { ok: false, detail: "panel opened but listed no wallpapers" };
 
   await clickPoint(page, opened.pick.x, opened.pick.y);
@@ -194,6 +195,11 @@ async function main() {
   if (!target) { console.error("selftest: Codex desktop page not found on DevTools ports - is Codex Desktop open?"); process.exit(1); }
   const page = await connectPage(target);
   try { await page.command("Page.bringToFront"); } catch {}
+  /* Chromium freezes rAF while the window is occluded or minimised, so every
+     WebGL scene would "fall back" even though nothing is wrong. Focus emulation
+     lets the harness observe what a foreground window observes; it changes no
+     product code and is test-harness only. */
+  try { await page.command("Emulation.setFocusEmulationEnabled", { enabled: true }); } catch {}
   await sleep(1000);
 
   const status = await json(`${BASE}/status`);

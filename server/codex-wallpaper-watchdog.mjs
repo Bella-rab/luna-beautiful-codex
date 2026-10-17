@@ -3,8 +3,9 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { listWallpapers, resolveWallpaperMedia, invalidateWallpaperCache } from "./wallpaper-library.mjs";
+import { listWallpapers, resolveWallpaperMedia, invalidateWallpaperCache, uploadsDir } from "./wallpaper-library.mjs";
 import { APPEARANCE_BUILD, normalizeAppearance, withFactoryPresets } from "./appearance.mjs";
+import { TRANSITION_MS, filterWallpapers, libraryPayload, normalizeLibrary, tagOf } from "./library-state.mjs";
 
 const root = import.meta.dirname;
 const stateRoot = path.join(process.env.APPDATA || os.homedir(), "Codex", "luna-beautiful-codex");
@@ -78,6 +79,11 @@ const PREWARM_CLICK_WAIT_MS = 600;
    instead of waited for. */
 const PREWARM_READY_WINDOW_MS = 900;
 const IDLE_TICK_MS = 800;
+/* Phase 2 rotation. A prewarmed switch is preferred but bounded: past this the
+   rotation installs directly, so a slow scene can never stall the timer. */
+const ROTATION_PREWARM_WAIT_MS = 2500;
+const ROTATION_FAIL_TTL_MS = 10 * 60 * 1000;
+const ROTATION_RETRY_MS = 1500;
 let lastContextRemount = 0;
 let contextRemounts = 0;
 let contextLostSeenAt = 0;
@@ -139,7 +145,7 @@ function prefs() {
   /* prefs() sits on the 800ms hot path, so the stored appearance object is handed back
      untouched - writeAppearance() already clamped it before it was written. Anything that
      needs the full shape reads appearanceState(). */
-  return { whiteText: true, appearance: null, ...readJson(prefsPath, null) };
+  return { whiteText: true, appearance: null, library: null, ...readJson(prefsPath, null) };
 }
 
 function writePrefs(patch) {
@@ -159,6 +165,56 @@ function writeAppearance(raw) {
   const appearance = withFactoryPresets(normalizeAppearance(raw));
   writePrefs({ appearance });
   return appearance;
+}
+
+/* Phase 2 library state: filters, tags, hidden ids, rotation and transitions.
+   The picker polls /status every tick, so the stored object is re-normalized on
+   read; normalizeLibrary is pure and cheap (a handful of keys plus the id lists). */
+function libraryState() {
+  return normalizeLibrary(prefs().library);
+}
+
+function writeLibrary(raw) {
+  const library = normalizeLibrary(raw);
+  writePrefs({ library });
+  return library;
+}
+
+/* The page-side reveal animates with these; the speed name is resolved to
+   milliseconds here so the page never has to know the table. */
+function transitionFor() {
+  const transition = libraryState().transition;
+  return { mode: transition.mode, dir: transition.dir, speedMs: TRANSITION_MS[transition.speed] };
+}
+
+/* Injected into every page expression that reveals a new wallpaper layer. */
+const SWITCH_SOURCE = "/* Phase 2 switch transitions. New layers are staged at opacity 0 behind the\n   visible wallpaper and only start moving once the caller has the fresh mount\n   ready, so the page never shows a frame without a background. Only CSS\n   transition/transform/clip-path are used - no per-frame JS. */\nwindow.__lunaSwitchTransition = (baseEl, mediaEl, oldLayers, cfg, cleanup) => {\n  cfg = cfg || {};\n  let mode = String(cfg.mode || 'fade');\n  const dir = String(cfg.dir || 'left');\n  const speed = Math.max(80, Math.min(1200, Number(cfg.speedMs) || 360));\n  let reduced = false;\n  try { reduced = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (e) {}\n  if (reduced || document.visibilityState === 'hidden') mode = 'cut';\n  if (['cut','fade','zoom','push','wipe','iris','bars'].indexOf(mode) < 0) mode = 'fade';\n  const news = [baseEl, mediaEl].filter(Boolean);\n  const olds = (oldLayers || []).filter(el => el && el.isConnected);\n  const ease = 'cubic-bezier(.22,.61,.36,1)';\n  const finish = () => { try { if (cleanup) cleanup(); } catch (e) {} };\n  const settle = () => {\n    for (const el of news) {\n      el.style.transition = '';\n      el.style.transform = '';\n      el.style.clipPath = '';\n      el.style.opacity = '1';\n      try { el.style.setProperty('z-index', '0', 'important'); el.style.setProperty('background', '#000', 'important'); } catch (e) {}\n    }\n  };\n  if (mode === 'cut') {\n    for (const el of news) el.style.opacity = '1';\n    for (const el of olds) el.style.opacity = '0';\n    settle(); finish(); return mode;\n  }\n  for (const el of news) { try { el.style.setProperty('z-index', '2', 'important'); el.style.setProperty('background', 'transparent', 'important'); } catch (e) {} }\n  for (const el of olds) { try { el.style.setProperty('z-index', '0', 'important'); } catch (e) {} }\n  const raf = fn => { let fired = false; const go = () => { if (fired) return; fired = true; fn(); }; try { requestAnimationFrame(() => requestAnimationFrame(go)); } catch (e) {} setTimeout(go, 80); };\n  const end = () => { settle(); finish(); };\n  if (mode === 'fade') {\n    for (const el of news) { el.style.transition = 'opacity ' + speed + 'ms ease'; el.style.opacity = '0'; }\n    for (const el of olds) { el.style.transition = 'opacity ' + speed + 'ms ease'; el.style.opacity = '1'; }\n    raf(() => { for (const el of news) el.style.opacity = '1'; });\n    setTimeout(end, speed + 60); return mode;\n  }\n  if (mode === 'zoom') {\n    for (const el of news) { el.style.transformOrigin = '50% 50%'; el.style.transition = 'opacity ' + speed + 'ms ease, transform ' + speed + 'ms ' + ease; el.style.transform = 'scale(1.06)'; el.style.opacity = '0'; }\n    for (const el of olds) { el.style.transformOrigin = '50% 50%'; el.style.transition = 'transform ' + speed + 'ms ' + ease; }\n    raf(() => { for (const el of news) { el.style.opacity = '1'; el.style.transform = 'scale(1)'; } for (const el of olds) el.style.transform = 'scale(1.04)'; });\n    setTimeout(end, speed + 60); return mode;\n  }\n  if (mode === 'push') {\n    const axis = (dir === 'up' || dir === 'down') ? 'Y' : 'X';\n    const sign = (dir === 'right' || dir === 'down') ? 1 : -1;\n    const from = axis === 'X' ? 'translateX(' + (sign * 100) + '%)' : 'translateY(' + (sign * 100) + '%)';\n    const out = axis === 'X' ? 'translateX(' + (-sign * 100) + '%)' : 'translateY(' + (-sign * 100) + '%)';\n    for (const el of news) { el.style.transition = 'transform ' + speed + 'ms ' + ease; el.style.transform = from; el.style.opacity = '1'; }\n    for (const el of olds) { el.style.transition = 'transform ' + speed + 'ms ' + ease; }\n    raf(() => { for (const el of news) el.style.transform = 'translate(0,0)'; for (const el of olds) el.style.transform = out; });\n    setTimeout(end, speed + 60); return mode;\n  }\n  if (mode === 'wipe') {\n    const closed = { left: 'inset(0 100% 0 0)', right: 'inset(0 0 0 100%)', up: 'inset(100% 0 0 0)', down: 'inset(0 0 100% 0)' }[dir] || 'inset(0 100% 0 0)';\n    for (const el of news) { el.style.transition = 'clip-path ' + speed + 'ms ' + ease; el.style.clipPath = closed; el.style.opacity = '1'; }\n    raf(() => { for (const el of news) el.style.clipPath = 'inset(0 0 0 0)'; });\n    setTimeout(end, speed + 60); return mode;\n  }\n  if (mode === 'iris') {\n    for (const el of news) { el.style.transition = 'clip-path ' + speed + 'ms ' + ease; el.style.clipPath = 'circle(0% at 50% 50%)'; el.style.opacity = '1'; }\n    raf(() => { for (const el of news) el.style.clipPath = 'circle(75% at 50% 50%)'; });\n    setTimeout(end, speed + 60); return mode;\n  }\n  if (mode === 'bars') {\n    const n = 6;\n    const build = open => { const pts = []; const step = 100 / n; for (let i = 0; i < n; i += 1) { const a = i * step; const b = a + (open ? step : 0); pts.push(a + '% 0%', b + '% 0%', b + '% 100%', a + '% 100%'); } return 'polygon(' + pts.join(',') + ')'; };\n    for (const el of news) { el.style.transition = 'clip-path ' + speed + 'ms ' + ease; el.style.clipPath = build(false); el.style.opacity = '1'; }\n    raf(() => { for (const el of news) el.style.clipPath = build(true); });\n    setTimeout(end, speed + 60); return mode;\n  }\n  return mode;\n};";
+
+/* Rotation candidates honour exactly the filters the picker shows, and skip the
+   wallpaper that is already playing. */
+function rotationCandidates(currentId, library) {
+  const visible = filterWallpapers(listWallpapers(), library, { showHidden: false });
+  return visible.filter(item => {
+    if (item.id === currentId) return false;
+    const failedAt = rotationFailed.get(item.id);
+    return !failedAt || Date.now() - failedAt > ROTATION_FAIL_TTL_MS;
+  });
+}
+
+/* Surfaced through /status and mirrored into the picker so the panel can show the
+   countdown without keeping its own timer. */
+function rotationState() {
+  const library = libraryState();
+  const candidates = library.rotation.enabled ? rotationCandidates(selection().source, library) : [];
+  return {
+    enabled: library.rotation.enabled,
+    intervalSec: library.rotation.intervalSec,
+    order: library.rotation.order,
+    candidates: candidates.length,
+    nextInSec: library.rotation.enabled && rotationNextAt ? Math.max(0, Math.round((rotationNextAt - Date.now()) / 1000)) : null,
+    lastSwitchAt: lastRotationSwitchAt || null,
+    skipped: [...rotationFailed.keys()]
+  };
 }
 
 /* The panel POSTs its state here. The body is only a few KB, but it is still bounded so
@@ -203,7 +259,14 @@ async function acquireServer() {
           res.end(JSON.stringify({ ok: true, pid: process.pid }));
         } else if (url.pathname === "/wallpapers") {
           res.writeHead(200, { "content-type": "application/json" });
-          res.end(JSON.stringify(listWallpapers().map(item => ({ id: item.id, title: item.title, quality: item.renderMode === "native" ? "原生高清" : item.renderMode === "webgl" ? "WebGL渲染" : "静态预览", renderMode: item.renderMode }))));
+          if (url.searchParams.get("refresh")) invalidateWallpaperCache();
+          const library = libraryState();
+          const hidden = new Set(library.hidden);
+          res.end(JSON.stringify(listWallpapers().map(item => ({
+            id: item.id, title: item.title, custom: !!item.custom, kind: item.kind || "image",
+            tag: tagOf(library, item.id), hidden: hidden.has(item.id),
+            quality: item.renderMode === "native" ? "原生高清" : item.renderMode === "webgl" ? "WebGL渲染" : "静态预览", renderMode: item.renderMode
+          }))));
         } else if (url.pathname === "/select") {
           const id = url.searchParams.get("id") || "";
           const wallpaper = listWallpapers().find(item => item.id === id);
@@ -218,6 +281,25 @@ async function acquireServer() {
           } else {
             res.writeHead(404, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: "wallpaper not found" }));
+          }
+        } else if (url.pathname === "/library") {
+          if (req.method === "POST") {
+            let parsed = null;
+            try { parsed = JSON.parse((await readBody(req)) || "{}"); } catch { parsed = null; }
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+              res.writeHead(400, { "content-type": "application/json" });
+              res.end(JSON.stringify({ ok: false, error: "expected a JSON object body" }));
+            } else {
+              const library = writeLibrary(parsed.library === undefined ? parsed : parsed.library);
+              /* external writers (tests, scripts) must reach the open picker too */
+              libraryMirrorPending = true;
+              log("library state written via http (hidden=" + library.hidden.length + ", rotation=" + library.rotation.enabled + ")");
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(JSON.stringify({ ok: true, library }));
+            }
+          } else {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify(libraryPayload(libraryState(), listWallpapers(), { rotation: rotationState() })));
           }
         } else if (url.pathname === "/white-text") {
           const enabled = url.searchParams.get("enabled") !== "false";
@@ -242,7 +324,7 @@ async function acquireServer() {
             res.end(JSON.stringify({ ...prefs(), appearance: appearanceState() }));
           }
         } else if (url.pathname === "/status") {
-          const payload = { selection: selection(), prefs: prefs(), appearance: appearanceState(), pid: process.pid, deferredUpgrade: lastDeferredUpgrade, quality: lastQuality, lastQualityEvent: lastQuality, qualitySettledForScene: [...qualitySceneStats].filter(([, v]) => v.settled).map(([id]) => id), contextRemounts, version: pluginVersion, pluginDir };
+          const payload = { selection: selection(), prefs: prefs(), appearance: appearanceState(), library: libraryState(), rotation: rotationState(), glassEconomy, pid: process.pid, deferredUpgrade: lastDeferredUpgrade, quality: lastQuality, lastQualityEvent: lastQuality, qualitySettledForScene: [...qualitySceneStats].filter(([, v]) => v.settled).map(([id]) => id), contextRemounts, version: pluginVersion, pluginDir };
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify(payload));
         } else if (url.pathname.startsWith("/scene-fallback/")) {
@@ -374,6 +456,30 @@ async function status() {
         return (host && host.dataset.prefsRequest) || "";
       })(),
       picker: !!document.getElementById("codex-wallpaper-picker"),
+      /* Phase 2: the picker has no fetch (CSP), so its library edits, the mirror
+         request and the upload hand-off all ride on dataset attributes. */
+      libraryCommand: (() => {
+        const picker = document.getElementById("codex-wallpaper-picker");
+        const value = (picker && picker.dataset.libraryCommand) || "";
+        if (picker) picker.dataset.libraryCommand = "";
+        return value;
+      })(),
+      libraryRequest: (() => {
+        const picker = document.getElementById("codex-wallpaper-picker");
+        return (picker && picker.dataset.libraryRequest) || "";
+      })(),
+      uploadReady: (() => {
+        const picker = document.getElementById("codex-wallpaper-picker");
+        const value = (picker && picker.dataset.uploadReady) || "";
+        if (picker) picker.dataset.uploadReady = "";
+        return value;
+      })(),
+      uploadDelete: (() => {
+        const picker = document.getElementById("codex-wallpaper-picker");
+        const value = (picker && picker.dataset.uploadDelete) || "";
+        if (picker) picker.dataset.uploadDelete = "";
+        return value;
+      })(),
       whiteText: !!document.getElementById("codex-force-white-style"),
       deferredUpgrade: (() => { const v = window.__codexDeferredWebGL || null; if (v) { const d = window.__codexDeferredDiag || ""; window.__codexDeferredWebGL = null; window.__codexDeferredDiag = null; return { result: v, lastDiag: d }; } return null; })(),
       contextLost: window.__codexContextLost || null,
@@ -695,7 +801,8 @@ async function installSceneWebGL(found, current, options = {}) {
     if (options.commit) {
       phaseMs.pre = 0;
       return await command("Runtime.evaluate", {
-        expression: `(() => {
+        expression: `${SWITCH_SOURCE}
+(() => {
           const wallpaperId = ${JSON.stringify(wallpaperId)};
           const expectedToken = ${JSON.stringify(options.prewarmToken || "")};
           const pending = window.__codexPrewarm || null;
@@ -722,23 +829,21 @@ async function installSceneWebGL(found, current, options = {}) {
           mediaEl.id = "codex-custom-background-media";
           document.body.prepend(mediaEl);
           document.body.prepend(base);
-          base.style.opacity = "1";
-          mediaEl.style.opacity = "1";
-          for (const el of oldLayers) {
-            if (!el || !el.isConnected) continue;
-            const deadCanvas = el.querySelector ? el.querySelector("canvas") : null;
-            el.style.transition = "opacity 260ms ease";
-            el.style.opacity = "0";
-            whenIdle(() => {
-              try {
-                if (deadCanvas) { const ctx = deadCanvas.getContext("webgl2") || deadCanvas.getContext("webgl"); const ext = ctx && ctx.getExtension ? ctx.getExtension("WEBGL_lose_context") : null; if (ext) ext.loseContext(); }
-                el.remove();
-              } catch {}
-            }, 700);
-          }
-          if (previousInstance && previousInstance !== pending.instance) {
-            whenIdle(() => { try { previousInstance.destroy && previousInstance.destroy(); } catch {} try { previousInstance.unmount && previousInstance.unmount(); } catch {} try { previousInstance.dispose && previousInstance.dispose(); } catch {} }, 1000);
-          }
+          window.__lunaSwitchTransition(base, mediaEl, oldLayers, ${JSON.stringify(transitionFor())}, () => {
+            for (const el of oldLayers) {
+              if (!el || !el.isConnected) continue;
+              const deadCanvas = el.querySelector ? el.querySelector("canvas") : null;
+              whenIdle(() => {
+                try {
+                  if (deadCanvas) { const ctx = deadCanvas.getContext("webgl2") || deadCanvas.getContext("webgl"); const ext = ctx && ctx.getExtension ? ctx.getExtension("WEBGL_lose_context") : null; if (ext) ext.loseContext(); }
+                  el.remove();
+                } catch {}
+              }, 700);
+            }
+            if (previousInstance && previousInstance !== pending.instance) {
+              whenIdle(() => { try { previousInstance.destroy && previousInstance.destroy(); } catch {} try { previousInstance.unmount && previousInstance.unmount(); } catch {} try { previousInstance.dispose && previousInstance.dispose(); } catch {} }, 1000);
+            }
+          });
           return { ok: true, renderMode: "webgl", source: wallpaperId, via: "prewarm", pkgBytes: pending.pkgLen || 0, mountMs: 0, revealMs: Math.round(performance.now() - started), prewarmed: true };
         })()`,
         returnByValue: true,
@@ -802,7 +907,8 @@ async function installSceneWebGL(found, current, options = {}) {
     phaseMs.pre = Date.now() - preStartedAt;
     if (selectEpoch !== installEpoch || (options.cancelled && options.cancelled())) { log(`install aborted (superseded): ${wallpaperId}`); return { ok: true, renderMode: "aborted", source: wallpaperId }; }
     return await command("Runtime.evaluate", {
-      expression: `(async () => {
+      expression: `${SWITCH_SOURCE}
+(async () => {
         const wallpaperId = ${JSON.stringify(wallpaperId)};
         const libraryAvailable = ${JSON.stringify(!!libraryAvailable)};
         const PREWARM_ONLY = ${JSON.stringify(options.prewarm === true)};
@@ -876,15 +982,13 @@ async function installSceneWebGL(found, current, options = {}) {
           mediaEl.id = "codex-custom-background-media";
           document.body.prepend(mediaEl);
           document.body.prepend(baseEl);
-          baseEl.style.opacity = "1";
-          mediaEl.style.opacity = "1";
-          for (const el of oldLayers) {
-            if (!el || !el.isConnected) continue;
-            const deadCanvas = el.querySelector ? el.querySelector("canvas") : null;
-            el.style.transition = "opacity 260ms ease";
-            el.style.opacity = "0";
-            whenIdle(() => { try { if (deadCanvas) loseGl(deadCanvas); el.remove(); } catch {} }, 700);
-          }
+          window.__lunaSwitchTransition(baseEl, mediaEl, oldLayers, ${JSON.stringify(transitionFor())}, () => {
+            for (const el of oldLayers) {
+              if (!el || !el.isConnected) continue;
+              const deadCanvas = el.querySelector ? el.querySelector("canvas") : null;
+              whenIdle(() => { try { if (deadCanvas) loseGl(deadCanvas); el.remove(); } catch {} }, 700);
+            }
+          });
         };
         const renderFallback = (reason, oldLayers) => {
           const data = window.__codexSceneFallback;
@@ -1157,7 +1261,8 @@ async function installBackground(current) {
     }
     const via = fileIndex >= 0 ? "file" : "cdp";
     return await command("Runtime.evaluate", {
-      expression: `(async () => {
+      expression: `${SWITCH_SOURCE}
+(async () => {
         const loseGl = (el) => { try { const ctx = el && el.getContext ? (el.getContext("webgl2") || el.getContext("webgl")) : null; if (ctx && ctx.getExtension) { const ext = ctx.getExtension("WEBGL_lose_context"); if (ext) ext.loseContext(); } } catch {} };
         const previousLayers = () => ["codex-custom-background-base", "codex-custom-background-media"].map(id => document.getElementById(id)).filter(Boolean);
         const oldLayers = previousLayers();
@@ -1208,8 +1313,6 @@ async function installBackground(current) {
           el.addEventListener("error", done, { once: true });
           setTimeout(done, 4000);
         });
-        el.style.opacity = "1";
-        base.style.opacity = "1";
         const applyStyleOnce = (id, text) => {
           const existing = document.getElementById(id);
           if (existing && existing.textContent === text) return;
@@ -1236,16 +1339,16 @@ async function installBackground(current) {
           try { if (typeof window.requestIdleCallback === "function") { window.requestIdleCallback(run, { timeout: timeoutMs }); return; } } catch {}
           setTimeout(run, timeoutMs);
         };
-        for (const old of oldLayers) {
-          if (!old || !old.isConnected || old === el || old === base) continue;
-          const deadCanvas = old.querySelector ? old.querySelector("canvas") : null;
-          const deadUrl = old.getAttribute ? old.getAttribute("data-object-url") : null;
-          old.style.transition = "opacity 260ms ease";
-          old.style.opacity = "0";
-          whenIdle(() => { try { if (deadCanvas) loseGl(deadCanvas); if (deadUrl) URL.revokeObjectURL(deadUrl); old.remove(); } catch {} }, 700);
-        }
-        if (previousInstance) whenIdle(() => { try { previousInstance.destroy && previousInstance.destroy(); } catch {} try { previousInstance.unmount && previousInstance.unmount(); } catch {} try { previousInstance.dispose && previousInstance.dispose(); } catch {} }, 1000);
         applyStyleOnce("codex-custom-background-style", BACKGROUND_STYLE_TEXT);
+        window.__lunaSwitchTransition(base, el, oldLayers, ${JSON.stringify(transitionFor())}, () => {
+          for (const old of oldLayers) {
+            if (!old || !old.isConnected || old === el || old === base) continue;
+            const deadCanvas = old.querySelector ? old.querySelector("canvas") : null;
+            const deadUrl = old.getAttribute ? old.getAttribute("data-object-url") : null;
+            whenIdle(() => { try { if (deadCanvas) loseGl(deadCanvas); if (deadUrl) URL.revokeObjectURL(deadUrl); old.remove(); } catch {} }, 700);
+          }
+          if (previousInstance) whenIdle(() => { try { previousInstance.destroy && previousInstance.destroy(); } catch {} try { previousInstance.unmount && previousInstance.unmount(); } catch {} try { previousInstance.dispose && previousInstance.dispose(); } catch {} }, 1000);
+        });
         if (${JSON.stringify(isVideo)}) el.play().catch(() => {});
         return { bytes: byteLen, type: ${JSON.stringify(media.type)}, renderMode: ${JSON.stringify(media.renderMode)}, source: ${JSON.stringify(current.source)}, via: ${JSON.stringify(via)} };
       })()`,
@@ -1268,6 +1371,16 @@ async function installBackground(current) {
    Attempts are cooldown-gated rather than once-per-mount so a scene downgraded
    again hours later can recover, and every attempt is logged and surfaced in
    /status. */
+async function pageCommand(expression, timeoutMs = 20000) {
+  const found = await findPage();
+  if (!found) return null;
+  try {
+    return await withPage(found.target, command => command("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, timeoutMs));
+  } catch {
+    return null;
+  }
+}
+
 async function pageEval(expression, timeoutMs = 20000) {
   const found = await findPage();
   if (!found) return null;
@@ -1359,6 +1472,20 @@ log(`watchdog started pid=${process.pid}`);
 let lastWhite = null;
 let lastPickerOpen = false;
 let lastAppearanceRefresh = "";
+/* Phase 2: rotation and the glass economy flag. rotationNextAt is epoch ms, so a
+   config change simply rewrites it instead of restarting a timer object. */
+let rotationNextAt = 0;
+let rotationPending = null;
+let rotationPendingAt = 0;
+let lastRotationSwitchAt = 0;
+const rotationFailed = new Map();
+let lastLibraryRequest = "";
+let libraryMirrorPending = false;
+let glassEconomy = null;
+let lastEconomyPush = "";
+let economyLowStreak = 0;
+let economyHighSince = 0;
+let uploadRun = null;
 let prewarm = null;
 let prewarmEpoch = 0;
 let prewarmBusy = false;
@@ -1463,6 +1590,151 @@ async function commitPrewarmSelection(current, staged) {
     return false;
   } catch (error) { log(`prewarm commit failed for ${current.source}: ${error.message}`); return false; }
 }
+/* ---------------- Phase 2 rotation ---------------- */
+function pickRotationTarget(currentId, library) {
+  const candidates = rotationCandidates(currentId, library);
+  if (!candidates.length) {
+    /* Everything was skipped: a stale failure list must not freeze rotation
+       forever, so clear it and retry once. */
+    if (rotationFailed.size) { rotationFailed.clear(); const retry = rotationCandidates(currentId, library); if (retry.length) return retry[0].id; }
+    return "";
+  }
+  if (library.rotation.order === "random") return candidates[Math.floor(Math.random() * candidates.length)].id;
+  const ordered = filterWallpapers(listWallpapers(), library, { showHidden: false });
+  const index = ordered.findIndex(item => item.id === currentId);
+  for (let step = 1; step <= ordered.length; step++) {
+    const candidate = ordered[(index + step) % ordered.length];
+    if (candidate && candidates.some(item => item.id === candidate.id)) return candidate.id;
+  }
+  return candidates[0].id;
+}
+
+/* Prepare-then-switch: stage the next scene in the hidden pending layer when it
+   is cheap enough to prewarm, and fall back to the normal install (which already
+   cross-fades) if the stage does not finish inside the bounded wait. */
+async function rotateTo(id) {
+  const item = listWallpapers().find(entry => entry.id === id);
+  if (!item) return false;
+  const next = { source: item.id, title: item.title };
+  const info = prewarmInfo(id);
+  if (info && !prewarm && !prewarmBusy) {
+    const staged = startPrewarm(id, info);
+    await Promise.race([staged.promise, wait(ROTATION_PREWARM_WAIT_MS)]);
+    if (staged.status === "ready") {
+      writeSelection(next.source, next.title);
+      if (await commitPrewarmSelection(next, staged)) {
+        prewarm = null;
+        prewarmEpoch++;
+        log("rotation switched " + id + " (prewarmed)");
+        return true;
+      }
+    }
+    if (prewarm === staged) dropPrewarm("rotation fallback", staged);
+  }
+  writeSelection(next.source, next.title);
+  mediaCache.delete(next.source);
+  log("rotation switched " + id);
+  return true;
+}
+
+/* ---------------- Phase 2 library mirror ---------------- */
+async function mirrorLibrary() {
+  const payload = libraryPayload(libraryState(), listWallpapers(), { rotation: rotationState(), t: Date.now() });
+  const json = JSON.stringify(JSON.stringify(payload));
+  return await pageCommand('(() => { const host = document.getElementById("codex-wallpaper-picker"); if (!host) return false; host.dataset.library = ' + json + '; return true; })()');
+}
+
+/* ---------------- Phase 2 uploads ----------------
+   The page can never read a path: it hands over the File the user picked, and the
+   bytes are pulled in 2MB slices through the existing DevTools session and written
+   here. Nothing crosses the network and the page CSP stays as it is. */
+const UPLOAD_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp", ".avif", ".mp4", ".webm", ".m4v", ".mov"]);
+const UPLOAD_CHUNK_BYTES = 2 * 1024 * 1024;
+const UPLOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+
+async function uploadReport(state, message) {
+  const payload = JSON.stringify(JSON.stringify({ state, message: message || "", t: Date.now() }));
+  await pageCommand('(() => { const host = document.getElementById("codex-wallpaper-picker"); if (!host) return false; host.dataset.uploadStatus = ' + payload + '; return true; })()');
+}
+
+/* Removing an uploaded wallpaper never touches anything outside the uploads
+   folder: the page can only name an id, and the file path is re-resolved here. */
+async function handleUploadDelete(raw) {
+  let cmd = null;
+  try { cmd = JSON.parse(raw); } catch { return; }
+  const id = String((cmd && cmd.id) || "");
+  const deleteFile = cmd && cmd.deleteFile === true;
+  const item = listWallpapers().find(entry => entry.id === id && entry.custom);
+  if (!item || !item.file) { await uploadReport("info", "找不到该上传壁纸"); return; }
+  const root = path.resolve(uploadsDir());
+  const file = path.resolve(item.file);
+  if (deleteFile) {
+    if (file === root || !file.startsWith(root + path.sep)) { await uploadReport("info", "拒绝删除上传目录之外的文件"); return; }
+    try { fs.unlinkSync(file); } catch (error) { log("upload delete failed " + id + ": " + error.message); await uploadReport("info", "文件删除失败：" + error.message); return; }
+  }
+  const current = libraryState();
+  const tags = { ...current.contentTags };
+  delete tags[id];
+  writeLibrary({ ...current, hidden: current.hidden.filter(entry => entry !== id), contentTags: tags });
+  invalidateWallpaperCache();
+  mediaCache.clear();
+  prewarmSizes.clear();
+  log("upload removed " + id + (deleteFile ? " (file deleted)" : " (file kept)"));
+  await uploadReport("info", deleteFile ? "已删除壁纸和文件" : "已移出列表（文件保留）");
+  await mirrorLibrary();
+}
+
+async function handleUpload(raw) {
+  if (uploadRun) { log("upload ignored: another upload is still running"); return; }
+  let meta = null;
+  try { meta = JSON.parse(raw); } catch { return; }
+  const name = String((meta && meta.name) || "").trim();
+  const size = Number((meta && meta.size) || 0);
+  const ext = path.extname(name).toLowerCase();
+  if (!name || !UPLOAD_EXTENSIONS.has(ext)) { log("upload rejected: unsupported file " + (name || "(unnamed)")); await uploadReport("error", "不支持的格式（JPG/PNG/WEBP/MP4/WEBM）"); return; }
+  if (!(size > 0) || size > UPLOAD_MAX_BYTES) { log("upload rejected: bad size " + size); await uploadReport("error", "文件为空或超过 2GB"); return; }
+
+  uploadRun = { name, size, done: 0 };
+  const safeName = name.replace(/[\\/:*?"<>|]/g, "_").slice(-120) || "wallpaper";
+  let dest = null;
+  try {
+    const dir = uploadsDir();
+    fs.mkdirSync(dir, { recursive: true });
+    dest = path.join(dir, Date.now() + "_" + safeName);
+    const fd = fs.openSync(dest, "w");
+    try {
+      for (let offset = 0; offset < size; offset += UPLOAD_CHUNK_BYTES) {
+        const end = Math.min(size, offset + UPLOAD_CHUNK_BYTES);
+        const expression = '(async () => {' +
+          ' const up = window.__lunaUpload;' +
+          ' if (!up || !up.file) return null;' +
+          ' const buffer = await up.file.slice(' + offset + ', ' + end + ').arrayBuffer();' +
+          ' const bytes = new Uint8Array(buffer);' +
+          ' if (typeof bytes.toBase64 === "function") return bytes.toBase64();' +
+          ' let binary = "";' +
+          ' for (let index = 0; index < bytes.length; index += 8192) binary += String.fromCharCode.apply(null, bytes.subarray(index, index + 8192));' +
+          ' return btoa(binary);' +
+          ' })()';
+        const b64 = await pageCommand(expression, 60000);
+        if (!b64) throw new Error("page lost the upload file");
+        fs.writeSync(fd, Buffer.from(b64, "base64"));
+        uploadRun.done = end;
+      }
+    } finally { fs.closeSync(fd); }
+    invalidateWallpaperCache();
+    mediaCache.clear();
+    log("upload saved: " + path.basename(dest) + " (" + (size / 1048576).toFixed(1) + "MB)");
+    await uploadReport("done");
+    await mirrorLibrary();
+  } catch (error) {
+    if (dest) { try { fs.unlinkSync(dest); } catch {} }
+    log("upload failed: " + error.message);
+    await uploadReport("error", error.message);
+  } finally {
+    uploadRun = null;
+    await pageCommand('(() => { try { window.__lunaUpload = null; } catch {} return true; })()');
+  }
+}
 for (;;) {
   let tickDelay = IDLE_TICK_MS;
   try {
@@ -1494,7 +1766,54 @@ for (;;) {
       lastAppearanceRefresh = state.appearanceRefresh || "";
       /* Mirror the saved state back so the panel can honour "read on open". */
       const mirror = JSON.stringify({ t: Date.now(), appearance: appearanceState() });
-      try { await command("Runtime.evaluate", { expression: `(() => { const host = document.getElementById("codex-appearance-panel"); if (!host) return false; host.dataset.prefs = ${JSON.stringify(mirror)}; return true; })()`, returnByValue: true }); } catch {}
+      await pageCommand(`(() => { const host = document.getElementById("codex-appearance-panel"); if (!host) return false; host.dataset.prefs = ${JSON.stringify(mirror)}; return true; })()`);
+    }
+    /* ---- Phase 2: picker library channel ---- */
+    if (state.page && state.libraryCommand) {
+      try {
+        const parsed = JSON.parse(state.libraryCommand);
+        const saved = writeLibrary(parsed && parsed.library !== undefined ? parsed.library : parsed);
+        log("library state saved via picker (hidden=" + saved.hidden.length + " types=" + (saved.filters.types.join("+") || "all") + " tag=" + saved.filters.tag + " rotation=" + saved.rotation.enabled + ")");
+        libraryMirrorPending = true;
+        if (!saved.rotation.enabled) { rotationNextAt = 0; rotationPending = null; }
+        else if (!rotationNextAt) rotationNextAt = Date.now() + saved.rotation.intervalSec * 1000;
+      } catch (error) { log("library command rejected: " + error.message); }
+    }
+    if (state.page && (state.libraryRequest !== lastLibraryRequest || libraryMirrorPending)) {
+      lastLibraryRequest = state.libraryRequest || "";
+      libraryMirrorPending = false;
+      await mirrorLibrary();
+    }
+    if (state.page && state.uploadReady) await handleUpload(state.uploadReady);
+    if (state.page && state.uploadDelete) await handleUploadDelete(state.uploadDelete);
+
+    /* ---- Phase 2: auto rotation ---- */
+    let rotationTargetFromRotation = "";
+    const library = libraryState();
+    if (!library.rotation.enabled) {
+      rotationNextAt = 0;
+      rotationPending = null;
+    } else {
+      if (!rotationNextAt) rotationNextAt = Date.now() + library.rotation.intervalSec * 1000;
+      if (pickerPicked) {
+        /* A manual pick resets the timer instead of stopping rotation: the user
+           asked for this wallpaper now, not for the slideshow to end. */
+        rotationNextAt = Date.now() + library.rotation.intervalSec * 1000;
+        rotationPending = null;
+        log("rotation timer reset by manual pick");
+      } else if (!restoring && state.page && state.visibility === "visible" && !state.pickerOpen && Date.now() >= rotationNextAt) {
+        const targetId = pickRotationTarget(current.source, library);
+        if (targetId) {
+          log("rotation -> " + targetId + " (order=" + library.rotation.order + ", candidates=" + rotationCandidates(current.source, library).length + ")");
+          await rotateTo(targetId);
+          current = selection();
+          lastRotationSwitchAt = Date.now();
+          rotationTargetFromRotation = targetId;
+        } else {
+          log("rotation skipped: no candidate matches the current filters");
+        }
+        rotationNextAt = Date.now() + library.rotation.intervalSec * 1000;
+      }
     }
     if (state.page && preference.whiteText && !state.whiteText && lastWhite !== true) { await applyWhiteText(); lastWhite = true; }
     else if (state.page && !preference.whiteText && state.whiteText && lastWhite !== false) { await removeWhiteText(); lastWhite = false; }
@@ -1578,6 +1897,42 @@ for (;;) {
       lastQuality = null;
     }
 
+    /* ---- Phase 2: glass economy over WebGL ----
+       backdrop-filter over a live canvas is a per-frame composite pass; measured
+       here the full glass set costs ~9.5fps and the conversation surface alone
+       accounts for ~7 of it (34.2 -> 24.7 -> 31.5 fps). When the scene cannot hold
+       85% of the frame cap the conversation face drops only its blur pass: the
+       tint, border and radius stay, so the user's glass stays visibly on. */
+    const webglActive = state.page && !!state.quality;
+    const fpsNow = state.stats && Number.isFinite(state.stats.fps) ? state.stats.fps : null;
+    if (!webglActive) {
+      economyLowStreak = 0;
+      economyHighSince = 0;
+      glassEconomy = false;
+    } else if (state.visibility === "visible" && fpsNow !== null) {
+      if (fpsNow < QUALITY_SCENE_FPS * 0.85) {
+        economyLowStreak += 1;
+        economyHighSince = 0;
+        if (economyLowStreak >= 3 && glassEconomy !== true) {
+          glassEconomy = true;
+          log("glass economy on (WebGL fps " + fpsNow.toFixed(1) + " < 51): conversation blur skipped, tint and border kept");
+        }
+      } else if (fpsNow >= QUALITY_SCENE_FPS * 0.95) {
+        economyLowStreak = 0;
+        if (glassEconomy === true) {
+          if (!economyHighSince) economyHighSince = Date.now();
+          else if (Date.now() - economyHighSince >= 10000) { glassEconomy = false; economyHighSince = 0; log("glass economy off (WebGL fps " + fpsNow.toFixed(1) + " held for 10s)"); }
+        }
+      } else {
+        economyLowStreak = 0;
+        economyHighSince = 0;
+      }
+    }
+    const economyFlag = glassEconomy ? "1" : "0";
+    if (state.page && lastEconomyPush !== economyFlag) {
+      lastEconomyPush = economyFlag;
+      await pageCommand('(() => { const host = document.getElementById("codex-appearance-panel"); if (!host) return false; host.dataset.economy = "' + economyFlag + '"; const api = window.__lunaAppearance; if (api && api.refresh) api.refresh(); return true; })()');
+    }
     /* ---- hover prewarm ----
        A row has to be hovered before it can be clicked, so the mount is staged in
        the hidden pending layer while the user aims; the click then only pays the
@@ -1618,13 +1973,28 @@ for (;;) {
       restoring = true;
       const installSafety = setTimeout(() => { if (restoring) { log(`install forced-reset (over 180s): ${current.source}`); restoring = false; } }, 180000);
       try {
-        if (needsBackground) { const bgResult = await installBackground(current); if (bgResult && bgResult.renderMode === "aborted") log(`install aborted (superseded): ${current.source}`); else log(`background installed: ${current.source}`); }
+        if (needsBackground) {
+          const bgResult = await installBackground(current);
+          if (bgResult && bgResult.renderMode === "aborted") log(`install aborted (superseded): ${current.source}`);
+          else {
+            log(`background installed: ${current.source}`);
+            if (rotationTargetFromRotation && bgResult && bgResult.ok === false) {
+              rotationFailed.set(current.source, Date.now());
+              log(`rotation candidate ${current.source} failed; skipped for 10 minutes`);
+              rotationNextAt = Date.now() + ROTATION_RETRY_MS;
+            }
+          }
+        }
         if (needsBackground || needsControls) launchControls();
         if (needsAppearance) launchAppearance();
         if (needsPicker) launchPicker();
       } catch (error) { log(`restore error: ${error.message}`); mediaCache.delete(current.source); }
       finally { clearTimeout(installSafety); restoring = false; }
     }
+
+    /* Release the picker gate once the picked wallpaper is live. Without this the
+       first click of a session would suppress every later hover prewarm. */
+    if (pickerPicked && !restoring && state.background && state.base && state.source === pickerPicked) pickerPicked = '';
   } catch (error) { log(`error: ${error.message}`); }
   await nextTick(tickDelay);
 }
