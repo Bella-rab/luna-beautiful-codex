@@ -16,6 +16,28 @@ async function findPage() {
   return null;
 }
 
+/* Saved panel state, handed over by the watchdog through the environment. The
+   page cannot fetch the watchdog (CSP connect-src), and this script is spawned
+   fresh after every wallpaper switch, so anything not passed in here would be
+   lost - which is exactly how the opacity override and the readability slider
+   used to snap back to their defaults on every switch. */
+const initialState = (() => {
+  try { return JSON.parse(process.env.LUNA_CONTROLS_STATE || "{}") || {}; } catch { return {}; }
+})();
+const READABILITY_MODES = ["halo", "soft", "bubble"];
+const initialReadability = (() => {
+  const raw = initialState.readability && typeof initialState.readability === "object" ? initialState.readability : {};
+  const percent = Math.max(0, Math.min(100, Math.round(Number(raw.percent))));
+  return {
+    percent: Number.isFinite(percent) ? percent : 45,
+    mode: READABILITY_MODES.includes(raw.mode) ? raw.mode : "soft"
+  };
+})();
+const initialOpacity = (() => {
+  const raw = Number(initialState.backgroundOpacity);
+  return Number.isFinite(raw) ? Math.max(5, Math.min(100, Math.round(raw))) : null;
+})();
+
 const target = await findPage();
 if (!target) throw new Error("Codex main page target not found");
 
@@ -95,7 +117,10 @@ const expression = `(() => {
     <button class="chip">背景透明度</button>
   \`;
 
-  const media = document.getElementById("codex-custom-background-media");
+  /* Resolved on demand: every wallpaper switch replaces the media element, and a
+     panel that kept the old node would dim a detached layer while the live one
+     stayed bright. */
+  const liveMedia = () => document.getElementById("codex-custom-background-media");
   const root = shadow.querySelector(".panel");
   const chip = shadow.querySelector(".chip");
   const range = shadow.querySelector("input");
@@ -104,7 +129,18 @@ const expression = `(() => {
   const output = shadow.querySelector("output");
   const status = shadow.querySelector(".status");
   const close = shadow.querySelector(".close");
-  let readabilityMode = "soft";
+  let readabilityMode = ${JSON.stringify(initialReadability.mode)};
+
+  /* Writes the current panel values back to the watchdog, which persists them and
+     replays them into the next injection. */
+  function notifyWatchdog() {
+    try {
+      host.dataset.controlsCommand = JSON.stringify({
+        backgroundOpacity: Number(range.value),
+        readability: { percent: Number(readabilityRange.value), mode: readabilityMode }
+      });
+    } catch {}
+  }
 
   /* Controls are re-injected after every background swap because the panel has
      to rebind to the new media element, but the sheets and markers it writes are
@@ -140,6 +176,7 @@ const expression = `(() => {
 
   function apply(value) {
     const percent = Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
+    const media = liveMedia();
     render(percent);
     if (!media) {
       setText(status, "当前没有背景");
@@ -249,6 +286,7 @@ const expression = `(() => {
   let bubbleTintTimer = null;
 
   function tintSource() {
+    const media = liveMedia();
     if (!media) return null;
     if (media.tagName !== "VIDEO" && media.tagName !== "IMG") return null;
     if (typeof media.readyState !== "number" || media.readyState < 2) return null;
@@ -308,7 +346,7 @@ const expression = `(() => {
     if (!layer) {
       layer = document.createElement("div");
       layer.id = "codex-background-readability";
-      media?.after(layer);
+      liveMedia()?.after(layer);
     }
     const strength = percent / 100;
     if (document.body.dataset.codexReadabilityMode !== readabilityMode) document.body.dataset.codexReadabilityMode = readabilityMode;
@@ -337,27 +375,29 @@ const expression = `(() => {
     writeCss("codex-background-readability-style", readabilityCss.join("\\n"));
   }
 
-  if (!media) {
+  const initialMedia = liveMedia();
+  if (!initialMedia) {
     range.disabled = true;
     status.textContent = "当前没有背景";
   } else {
-    const percent = Math.round(Number(getComputedStyle(media).opacity || 1) * 100);
+    const percent = Math.round(Number(getComputedStyle(initialMedia).opacity || 1) * 100);
     render(percent);
-    status.textContent = "背景已连接 · " + (media.videoWidth || media.naturalWidth || 0) + "×" + (media.videoHeight || media.naturalHeight || 0);
+    status.textContent = "背景已连接 · " + (initialMedia.videoWidth || initialMedia.naturalWidth || 0) + "×" + (initialMedia.videoHeight || initialMedia.naturalHeight || 0);
   }
 
-  range.addEventListener("input", () => apply(range.value));
-  readabilityRange.addEventListener("input", () => applyReadability(readabilityRange.value));
+  range.addEventListener("input", () => { apply(range.value); notifyWatchdog(); });
+  readabilityRange.addEventListener("input", () => { applyReadability(readabilityRange.value); notifyWatchdog(); });
   shadow.querySelectorAll(".modes button").forEach(button => {
     button.addEventListener("click", () => {
       readabilityMode = button.dataset.mode;
       shadow.querySelectorAll(".modes button").forEach(item => item.classList.toggle("active", item === button));
       applyReadability(readabilityRange.value);
       syncBubbleTintTimer();
+      notifyWatchdog();
     });
   });
   shadow.querySelectorAll(".presets button").forEach(button => {
-    button.addEventListener("click", () => apply(button.dataset.value));
+    button.addEventListener("click", () => { apply(button.dataset.value); notifyWatchdog(); });
   });
   close.addEventListener("click", event => {
     event.stopPropagation();
@@ -402,9 +442,20 @@ const expression = `(() => {
     window.__codexReadabilitySurfaceTimer = setTimeout(markReadabilitySurfaces, 250);
   });
   window.__codexReadabilityObserver.observe(document.body, { childList: true, subtree: true });
-  apply(100);
-  applyReadability(45);
-  return { ok: true, backgroundInstalled: !!media, inlineControls: true };
+  /* The saved pref is authoritative: the media element's recorded value can be
+     stale (a scene canvas has no attribute at all), and this panel is the only
+     writer of that attribute. */
+  const savedOpacity = ${initialOpacity === null ? "null" : initialOpacity};
+  const recordedOpacity = (() => {
+    const node = liveMedia();
+    if (!node) return null;
+    const value = Number(node.getAttribute("data-background-opacity"));
+    return Number.isFinite(value) ? value : null;
+  })();
+  apply(savedOpacity !== null ? savedOpacity : recordedOpacity !== null ? Math.round(recordedOpacity * 100) : 100);
+  shadow.querySelectorAll(".modes button").forEach(item => item.classList.toggle("active", item.dataset.mode === readabilityMode));
+  applyReadability(${initialReadability.percent});
+  return { ok: true, backgroundInstalled: !!liveMedia(), inlineControls: true, readability: "${initialReadability.mode}:${initialReadability.percent}", opacity: savedOpacity };
 })()`;
 
 const result = await send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });

@@ -141,20 +141,98 @@ function backgroundCss(backgroundOpacity, surfaceOpacity, blur) {
   ].join("\n");
 }
 
-async function installBackground({ source, opacity = 1, surfaceOpacity = 0, blur = 0 }) {
+/* Panel tint for the watchdog-owned render paths. Uses its own <style> node so
+   it can never clobber the base sheet that keeps scene canvases visible. */
+async function applyPanelTuning({ surfaceOpacity = 0, blur = 0 }) {
+  const surface = boundedNumber(surfaceOpacity, 0, 0, 1);
+  const blurValue = boundedNumber(blur, 0, 0, 40);
+  const { target } = await findDevTools();
+  const page = new CodexPage(target);
+  await page.connect();
+  try {
+    return await page.evaluate(`(() => {
+      const media = document.getElementById("codex-custom-background-media");
+      if (!media) return { ok: false, error: "no background installed yet" };
+      const surface = ${JSON.stringify(surface)};
+      const blur = ${JSON.stringify(blurValue)};
+      let style = document.getElementById("codex-mcp-panel-style");
+      /* 0/0 is the default look: drop the sheet instead of leaving an inert
+         transparent override behind forever. */
+      if (surface === 0 && blur === 0) {
+        if (style) style.remove();
+        media.setAttribute("data-surface-opacity", "0");
+        media.setAttribute("data-blur", "0");
+        return { ok: true, cleared: true };
+      }
+      if (!style) { style = document.createElement("style"); style.id = "codex-mcp-panel-style"; document.head.append(style); }
+      style.textContent = [
+        'main[class*="_MainContentSurface_"] { background: rgba(16, 16, 22, ' + surface + ') !important; backdrop-filter: blur(' + blur + 'px) saturate(125%) !important; }',
+        'aside, nav, [class*="Sidebar"], [class*="sidebar"] { background: rgba(13, 13, 18, ' + Math.min(0.92, surface + 0.10) + ') !important; backdrop-filter: blur(' + Math.max(12, blur + 2) + 'px) saturate(125%) !important; }'
+      ].join("\\n");
+      media.setAttribute("data-surface-opacity", String(surface));
+      media.setAttribute("data-blur", String(blur));
+      return { ok: true, surfaceOpacity: surface, blur };
+    })()`, true);
+  } finally {
+    page.close();
+  }
+}
+
+async function installBackground({ source, opacity, surfaceOpacity = 0, blur = 0 }) {
+  /* A wallpaper that lives in the library is owned by the watchdog: it knows how
+     to render scenes (WebGL), web projects (sandboxed frame) and plain media, and
+     it persists the selection. Delegating keeps the picker, rotation and this
+     tool pointing at the same wallpaper. Only raw files/URLs are injected here,
+     and those first pause the watchdog's restore pass so it cannot replace them
+     on its next tick. */
+  let delegated = null;
+  let tunedOpacity = null;
   try {
     const resolved = resolveWallpaperMedia(source);
-    if (resolved.renderMode === "webgl") {
+    if (resolved.wallpaper) {
       const port = process.env.WATCHDOG_PORT || "43310";
-      const r = await fetch("http://127.0.0.1:" + port + "/select?id=" + resolved.wallpaper.id);
+      const r = await fetch("http://127.0.0.1:" + port + "/select?id=" + encodeURIComponent(resolved.wallpaper.id));
       if (r.ok) {
         const j = await r.json();
-        return { ok: true, renderMode: "webgl", source: j.source, title: j.title, note: "Scene wallpaper delegated to watchdog for WebGL rendering; it will appear within a few seconds." };
+        delegated = { renderMode: resolved.renderMode, source: j.source, title: j.title };
+        /* Background opacity is watchdog state: the render paths rebuild their
+           layers on every switch, so an in-page style would be wiped. */
+        if (opacity !== undefined && opacity !== null && opacity !== "" && Number.isFinite(Number(opacity))) {
+          const percent = Math.min(100, Math.max(5, Math.round(Number(opacity) * 100)));
+          try {
+            const o = await fetch("http://127.0.0.1:" + port + "/opacity?value=" + percent);
+            if (o.ok) { const payload = await o.json(); tunedOpacity = payload; }
+          } catch {}
+        }
+        /* Panel tint (surfaceOpacity/blur) must not rewrite the watchdog's base
+           sheet - that sheet carries the scene canvas visibility rules. Write a
+           separate node instead and only when the caller asked for it. */
+        const wantsPanel = Number(surfaceOpacity) !== 0 || Number(blur) !== 0;
+        let tuned = null;
+        if (wantsPanel) {
+          for (let attempt = 0; attempt < 12; attempt++) {
+            tuned = await applyPanelTuning({ surfaceOpacity, blur });
+            if (tuned && tuned.ok) break;
+            await new Promise(resolve => setTimeout(resolve, 700));
+          }
+        }
+        return {
+          ok: true,
+          renderMode: resolved.renderMode,
+          source: j.source,
+          title: j.title,
+          tuning: tuned && tuned.ok ? tuned : undefined,
+          opacity: tunedOpacity || undefined,
+          note: delegated.renderMode === "webgl" ? "Scene wallpaper delegated to watchdog for WebGL rendering; it will appear within a few seconds."
+            : delegated.renderMode === "web" ? "Web wallpaper delegated to watchdog; it will appear in a sandboxed frame within a few seconds."
+            : "Wallpaper delegated to watchdog; the picker and rotation now point at it."
+        };
       }
-      if (resolved.fallbackVideo) source = resolved.fallbackVideo;
-      else if (resolved.fallbackPreview) source = resolved.fallbackPreview;
+      /* Watchdog unreachable: fall through to the in-page injector below. */
     }
   } catch {}
+  const port = process.env.WATCHDOG_PORT || "43310";
+  try { await fetch("http://127.0.0.1:" + port + "/disable"); } catch {}
   const media = await loadMedia(source);
   const backgroundOpacity = boundedNumber(opacity, 1, 0.05, 1);
   const surfaceOpacityValue = boundedNumber(surfaceOpacity, 0, 0, 1);
@@ -242,61 +320,60 @@ async function installBackground({ source, opacity = 1, surfaceOpacity = 0, blur
 }
 
 async function setOpacity({ opacity, surfaceOpacity, blur }) {
-  const { target } = await findDevTools();
-  const page = new CodexPage(target);
-  await page.connect();
-  try {
-    const current = await page.evaluate(`(() => {
-      const media = document.getElementById("codex-custom-background-media");
-      if (!media) return { installed: false };
-      return {
-        installed: true,
-        opacity: Number(media.getAttribute("data-background-opacity") || 0.85),
-        surfaceOpacity: Number(media.getAttribute("data-surface-opacity") || 0),
-        blur: Number(media.getAttribute("data-blur") || 0)
-      };
-    })()`);
-    if (!current.installed) return { ok: false, error: "No custom background is installed." };
-    const backgroundOpacity = boundedNumber(opacity ?? current.opacity, current.opacity, 0.05, 1);
-    const surfaceOpacityValue = boundedNumber(surfaceOpacity ?? current.surfaceOpacity, current.surfaceOpacity, 0, 1);
-    const blurValue = boundedNumber(blur ?? current.blur, current.blur, 0, 40);
-    const css = backgroundCss(backgroundOpacity, surfaceOpacityValue, blurValue);
-    return await page.evaluate(`(() => {
-      const backgroundOpacity = ${JSON.stringify(backgroundOpacity)};
-      const surfaceOpacityValue = ${JSON.stringify(surfaceOpacityValue)};
-      const blurValue = ${JSON.stringify(blurValue)};
-      const media = document.getElementById("codex-custom-background-media");
-      const style = document.getElementById("codex-custom-background-style");
-      if (!media || !style) return { ok: false, error: "No custom background is installed." };
-      media.style.opacity = String(backgroundOpacity);
-      media.setAttribute("data-background-opacity", String(backgroundOpacity));
-      media.setAttribute("data-surface-opacity", String(surfaceOpacityValue));
-      media.setAttribute("data-blur", String(blurValue));
-      style.textContent = ${JSON.stringify(css)};
-      return { ok: true, opacity: backgroundOpacity, surfaceOpacity: surfaceOpacityValue, blur: blurValue };
-    })()`, true);
-  } finally {
-    page.close();
+  /* An explicit background dim is watchdog-owned state so it survives wallpaper
+     switches; panel tint goes through its own sheet. Both are applied here so
+     this tool keeps working after the render path moved into the watchdog. */
+  const wantsDim = opacity !== undefined && opacity !== null && Number.isFinite(Number(opacity));
+  const wantsPanel = surfaceOpacity !== undefined || blur !== undefined;
+  if (!wantsDim && !wantsPanel) return { ok: false, error: "pass opacity, surfaceOpacity and/or blur" };
+  const out = { ok: true };
+  if (wantsDim) {
+    const percent = Math.min(100, Math.max(5, Math.round(Number(opacity) * 100)));
+    try {
+      const response = await fetch("http://127.0.0.1:" + (process.env.WATCHDOG_PORT || "43310") + "/opacity?value=" + percent);
+      if (response.ok) out.backgroundOpacity = (await response.json()).backgroundOpacity;
+      else out.backgroundOpacity = { ok: false, status: response.status };
+    } catch (error) { out.backgroundOpacity = { ok: false, error: String(error.message || error) }; }
   }
+  if (wantsPanel) {
+    out.panel = await applyPanelTuning({ surfaceOpacity: surfaceOpacity ?? 0, blur: blur ?? 0 });
+  }
+  return out;
 }
 
 async function resetBackground() {
+  /* Tell the watchdog first: its restore pass otherwise reinstalls the saved
+     wallpaper within one tick and the reset looks like a no-op. */
+  const port = process.env.WATCHDOG_PORT || "43310";
+  let watchdog = null;
+  try {
+    const r = await fetch("http://127.0.0.1:" + port + "/reset");
+    watchdog = r.ok ? await r.json() : { ok: false, status: r.status };
+  } catch (error) { watchdog = { ok: false, error: String(error.message || error) }; }
   const { target } = await findDevTools();
   const page = new CodexPage(target);
   await page.connect();
   try {
-    return await page.evaluate(`(() => {
+    const pageResult = await page.evaluate(`(() => {
       for (const media of document.querySelectorAll("#codex-custom-background-media, #codex-custom-background-video")) {
         const objectUrl = media.getAttribute("data-object-url");
         if (objectUrl) URL.revokeObjectURL(objectUrl);
         media.remove();
       }
       document.getElementById("codex-custom-background-base")?.remove();
+      document.getElementById("codex-custom-background-base-pending")?.remove();
+      document.getElementById("codex-custom-background-base-pending-hover")?.remove();
       document.getElementById("codex-custom-background-style")?.remove();
       document.getElementById("codex-background-opacity-style")?.remove();
+      document.getElementById("codex-wallpaper-shade")?.remove();
+      for (const id of ["codex-background-controls", "codex-background-readability", "codex-background-readability-style", "codex-mcp-panel-style"]) { try { document.getElementById(id)?.remove(); } catch {} }
       window.__codexBackgroundChunks = [];
-      return { ok: true, reset: true };
+      window.__codexWallpaperBytes = null;
+      try { const instance = window.__webwallglInstance; if (instance) { instance.destroy && instance.destroy(); instance.dispose && instance.dispose(); } } catch {}
+      window.__webwallglInstance = null;
+      return { ok: true, reset: true, remaining: document.querySelectorAll("#codex-custom-background-media").length };
     })()`, true);
+    return { ok: true, reset: true, disabled: true, watchdog, page: pageResult };
   } finally {
     page.close();
   }
@@ -313,6 +390,8 @@ async function backgroundStatus() {
       return {
         installed: !!media,
         styleInstalled: !!style,
+        renderMode: media?.getAttribute("data-render-mode") || null,
+        source: media?.getAttribute("data-wallpaper-source") || null,
         tagName: media?.tagName || null,
         readyState: media?.readyState ?? null,
         paused: media?.paused ?? null,
@@ -323,7 +402,15 @@ async function backgroundStatus() {
         error: media?.error?.message || null
       };
     })()`);
-    return { ok: true, devToolsPort: port, ...status };
+    let watchdog = null;
+    try {
+      const health = await fetch("http://127.0.0.1:" + (process.env.WATCHDOG_PORT || "43310") + "/status", { signal: AbortSignal.timeout(2500) });
+      if (health.ok) {
+        const snapshot = await health.json();
+        watchdog = { running: true, selection: snapshot.selection, version: snapshot.version };
+      } else watchdog = { running: false };
+    } catch { watchdog = { running: false }; }
+    return { ok: true, devToolsPort: port, ...status, watchdog };
   } finally {
     page.close();
   }
@@ -343,7 +430,7 @@ const TOOLS = [
   },
   {
     name: "set_background",
-    description: "Set an in-page image/video background for Codex only. Accepts a Wallpaper Engine ID/title, local file path, or http(s) URL.",
+    description: "Set an in-page image/video/Scene/web wallpaper background for Codex only. Accepts a Wallpaper Engine ID/title, local file path, or http(s) URL. Library wallpapers stay in sync with the bottom-right picker and auto-rotation.",
     inputSchema: {
       type: "object",
       properties: {
@@ -369,7 +456,7 @@ const TOOLS = [
   },
   {
     name: "reset_background",
-    description: "Remove the custom background and restore Codex's original page styling.",
+    description: "Remove the custom background and restore Codex's original page styling. Also pauses the watchdog's auto-restore so the background stays gone until you pick another wallpaper.",
     inputSchema: { type: "object", properties: {} }
   },
   {

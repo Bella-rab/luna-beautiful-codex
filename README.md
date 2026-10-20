@@ -13,6 +13,7 @@ English | [简体中文](README.zh-CN.md)
 - Saves each user's selected wallpaper under their own `%APPDATA%\Codex\luna-beautiful-codex`.
 - Restores the selected background automatically while Codex is open.
 - Does not change the Windows desktop wallpaper and does not make the Codex window transparent.
+- Adds a full appearance studio (liquid glass, presets, fonts, filters), library filters and rotation, click/trail/parallax effects, a mascot, Web wallpapers, wallpaper properties and an optional video audio track.
 
 ## Install
 
@@ -69,6 +70,26 @@ Alternatively you can simply ask Codex to install this repository as a personal 
 
 4. The local watcher restores your last selection the next time Codex starts; the choice is stored in `%APPDATA%\Codex\luna-beautiful-codex\wallpaper-selection.json`.
 
+## Appearance and effects
+
+The **外观** chip opens the appearance studio. Every change applies immediately and is stored in `prefs.json`:
+
+- **Liquid glass** — blur, tint, border, scrim and saturation for the sidebar, conversation, settings window, reasoning blocks and floaters. Each face can inherit, override or switch off; the sidebar supports independent corner radii and up to 8 extra selectors.
+- **Presets** — 黑客绿 / 磨砂 / 夜航 / 可读 / 鲜艳, plus JSON export and import.
+- **Fonts and colours** — global family (with a system-font picker), secondary/caption/body roles, per-component overrides, caret and accent colours.
+- **Background filters** — blur, brightness, contrast, saturation, opacity and darkening, with cover/contain/fill framing, position and zoom.
+- **Extensions** — click ripple/spark/ring, pointer trails, parallax, a session avatar and a draggable mascot. All effect layers are `pointer-events:none` and idle at zero rAF cost.
+
+## Wallpaper library
+
+Filter by type (scene / video / image / web), content tag and hidden state. Rows can be hidden without deleting files, local JPG/PNG/MP4/WebM files can be added, and auto-rotation chooses only from the current filter result. Seven switch transitions (cut, fade, zoom, push, wipe, iris, bars) stage the new layer first, so there is never a black frame.
+
+## Web wallpapers, properties and audio
+
+Wallpaper Engine `type: "web"` projects render inside a sandboxed iframe (`allow-scripts`, opaque origin, `pointer-events:none`). Stylesheets, images and fonts are inlined as data URLs; project scripts run through a DevTools bootstrap because the page CSP blocks inline scripts. A frame that does not become ready within 8 s falls back to the project's video or preview image. `general.properties` (scheme colour, sliders, combos, booleans) appear in the picker and reach Scene instances through `setProperties()` and web frames through `wallpaperPropertyListener.applyUserProperties`.
+
+Video wallpapers have an opt-in audio track with a volume control. Chromium blocks audible autoplay without a gesture, so the plugin starts muted and asks for one click instead of failing.
+
 ## Wallpaper types
 
 | Type | Render mode | Description |
@@ -76,6 +97,7 @@ Alternatively you can simply ask Codex to install this repository as a personal 
 | Video (mp4/webm/mov) | `native` | Direct video playback at original quality |
 | GIF / Image | `native` | Direct image display at original quality |
 | Scene (`.pkg`) | `webgl` | Real-time WebGL rendering via webwallgl; falls back to extracted video or static preview |
+| Web (`type: "web"`) | `web` | Sandboxed iframe with inlined assets; falls back to the project video/preview |
 | URL | `native` | Remote media fetched and displayed inline |
 
 ## Requirements
@@ -133,8 +155,12 @@ node server/selftest.mjs
 
 It switches to every wallpaper in the library, asserts each `webgl`-flagged one really rendered via WebGL (from the watchdog log), restores your previous selection, and exits non-zero on any failure.
 
+The run covers 31 assertions: per-wallpaper install and render mode, a real picker click, the appearance panel toggles, the liquid-glass sheet appearing and disappearing, transition switching, appearance persistence, extension effects (click FX and mascot), the web-wallpaper srcdoc builder, the library channel (hidden ids / type filters / rotation), dim and readability settings surviving a wallpaper switch, partial prefs writes not wiping the appearance block, forced white text, video volume, and `reset` staying reset instead of being restored by the next watchdog tick.
+
 ## Changelog
 
+- **0.3.1** — Self-test and tooling fixes. Six real defects: (1) `reset_background` reported success but the watchdog reinstalled the remembered wallpaper within one tick — there is now a `/reset` and `/disable` route, and a reset records `selection.disabled` so restore stays off until a new wallpaper is picked. (2) `set_background` injected native/web wallpapers without telling the watchdog, so the next tick replaced them — library wallpapers now always go through `/select` and only custom files/URLs use the in-page injector. (3) The dim/readability panel is rebuilt after every switch and hard-coded itself back to 100%/45%, wiping a dim or bubble setting; both values are now persisted and replayed. (4) The panel kept a reference to the old media node, so after a switch it dimmed a detached layer; the node is resolved on demand now. (5) `set_background`'s `opacity` argument did nothing once rendering moved into the watchdog — a new `/opacity` channel makes the dim persistent and re-applies it after every install. (6) `POST /prefs` treated any body without an `appearance` key as a bare appearance object, so a dim-only or readability-only write reset the whole appearance block to factory defaults; it now merges, and external writes are mirrored into the live page. The self-test grew from 22 to 31 assertions, and its glass check no longer fails purely because glass was already on.
+- **0.3.0** — Appearance studio, library and effects release. Adds liquid glass with six faces and per-face overrides, five factory presets with JSON import/export, fonts/colours, background filters and framing, click/trail/parallax effects, a session avatar and mascot, library filters/tags/hiding/uploads, auto-rotation, seven switch transitions, Web wallpapers in sandboxed iframes, Wallpaper Engine property controls, an optional video audio track, lazy-rendered appearance groups (panel opens in ≤50 ms), `appearance.lastError` in `/status`, and three new selftest UI assertions.
 - **0.2.3** — Smoother, sharper switches. Three root causes fixed: (1) some wallpapers write `"type": "Scene"` with a capital S in `project.json`, and the old exact-match logic only accepted lowercase `scene`, so those 3D wallpapers fell back to the stretched low-res `preview.gif` — that is the blurry first frame. A folder containing `scene.pkg` is now always treated as a Scene and rendered live through WebGL. (2) Every scan read each `scene.pkg` (up to 126 MB) fully into memory just to hunt for an embedded video, costing ~0.5-0.7 s, and a single switch scanned several times. Scans are now cached for 30 s and the per-package video probe is memoized on (path, mtime, size), so repeat scans cost 0 ms. (3) Switching tore the old background down before mounting the new one, so the page went black and the first thing the user saw was the blurry preview. The old layers now stay up until the replacement is ready and then cross-fade out - the measured black gap is 0 ms. Also: the render DPR is raised to `max(devicePixelRatio, 1.5)` with 4x MSAA (textures were previously sampled at 0.5-0.6x, a second source of blur) at no frame-rate cost (59-60 fps); the 100 MB+ embedded fallback video is no longer pre-injected when WebGL will be used; and an already-running watchdog is no longer respawned every few seconds. A typical Scene switch dropped from ~7.6 s to ~2 s.
 - **0.2.2** — Fixes the picker going dead. `GET /status` threw `state is not defined`, and the error handler then re-sent headers (`ERR_HTTP_HEADERS_SENT`), which killed the watchdog process itself — so anything that read `/status`, including the bundled `server/selftest.mjs`, silently stopped clicks from applying wallpapers. The endpoint now reports the real state and the handler can no longer take the process down. The picker panel is opened and closed by writing an explicit `display` rule instead of only toggling a class, so a leftover inline `display` can no longer keep the list hidden, and the list no longer rebuilds every 1.2 s (which used to swallow in-flight clicks and reset the scroll position mid-pick). The picker probes DevTools ports 9229–9239 like the watchdog instead of assuming 9229, and the MCP server now attaches to an already running watchdog instead of respawning one every 5 s.
 - **0.2.1** — Scene wallpapers render for real again: WebWallGL is vendored and the scene package is injected as bytes (`bytesSource`), bypassing the page CSP that made every page-side fetch fail (the cause of the pure-black background). Fallback media is also injected instead of fetched. The WebGL instance is torn down when switching to a native wallpaper (no more leaked GL contexts), background elements carry complete `data-wallpaper-source`/`data-render-mode` attributes, and a hidden/occluded window defers the WebGL mount instead of timing out to a static fallback. Added `server/selftest.mjs` (DevTools-based page assertions).

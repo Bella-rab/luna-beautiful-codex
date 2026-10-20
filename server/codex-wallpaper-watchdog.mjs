@@ -132,18 +132,24 @@ function readJson(filePath, fallback) {
 const pluginDir = path.dirname(root);
 const pluginVersion = readJson(path.join(pluginDir, ".codex-plugin", "plugin.json"), {}).version || null;
 
-function writeSelection(source, title) {
-  memorySelection = { source, title };
-  try { fs.mkdirSync(stateRoot, { recursive: true }); fs.writeFileSync(selectionPath, JSON.stringify({ source, title }, null, 2)); } catch {}
+/* `disabled` is the reset state: the user explicitly removed the background, so
+   the watchdog must stop restoring the remembered wallpaper. It lives next to
+   source/title instead of deleting the selection, so re-enabling from the picker
+   or MCP keeps the last wallpaper. Every ordinary selection clears it. */
+function writeSelection(source, title, extra = {}) {
+  memorySelection = { source: String(source || ""), title: String(title || ""), disabled: extra.disabled === true };
+  try { fs.mkdirSync(stateRoot, { recursive: true }); fs.writeFileSync(selectionPath, JSON.stringify(memorySelection, null, 2)); } catch {}
+  return memorySelection;
 }
 
 function selection() {
-  if (memorySelection && memorySelection.source) return memorySelection;
+  if (memorySelection && (memorySelection.source || memorySelection.disabled)) return memorySelection;
   const value = readJson(selectionPath, null);
-  if (value && value.source) return value;
+  if (value && (value.source || value.disabled === true)) {
+    return { source: String(value.source || ""), title: String(value.title || ""), disabled: value.disabled === true };
+  }
   const first = listWallpapers()[0];
-  const next = first ? { source: first.id, title: first.title } : { source: "", title: "" };
-  if (next.source) writeSelection(next.source, next.title);
+  const next = first ? writeSelection(first.id, first.title) : { source: "", title: "", disabled: false };
   return next;
 }
 
@@ -151,7 +157,70 @@ function prefs() {
   /* prefs() sits on the 800ms hot path, so the stored appearance object is handed back
      untouched - writeAppearance() already clamped it before it was written. Anything that
      needs the full shape reads appearanceState(). */
-  return { whiteText: true, appearance: null, library: null, ...readJson(prefsPath, null) };
+  return { whiteText: true, appearance: null, library: null, backgroundOpacity: null, readability: null, ...readJson(prefsPath, null) };
+}
+
+/* The readability panel's two controls. They are persisted so a wallpaper switch
+   (which tears the panel down and rebuilds it) does not silently reset the user's
+   text-shadow strength or surface mode. */
+const READABILITY_MODES = ["halo", "soft", "bubble"];
+function readabilityState() {
+  const raw = prefs().readability;
+  const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const percent = Number(source.percent);
+  return {
+    percent: Number.isFinite(percent) ? Math.min(100, Math.max(0, Math.round(percent))) : 45,
+    mode: READABILITY_MODES.includes(source.mode) ? source.mode : "soft"
+  };
+}
+
+/* Background opacity is a watchdog-owned preference, separate from the
+   readability slider: tools and the picker can dim the wallpaper without
+   touching the readability (text shadow) strength. null means "no override",
+   which leaves readability's own value in charge. */
+function backgroundOpacityValue() {
+  const raw = prefs().backgroundOpacity;
+  if (raw === null || raw === undefined) return null;
+  return backgroundOpacityValueFor(raw);
+}
+
+/* Clamp one caller-supplied value (number or numeric string) to the supported
+   range; anything unusable returns null so callers can report a 400. */
+function backgroundOpacityValueFor(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  return Math.min(100, Math.max(5, Math.round(number)));
+}
+
+async function applyBackgroundOpacity(percent) {
+  return await pageCommand(`(() => {
+    const percent = ${JSON.stringify(percent)};
+    const media = document.getElementById("codex-custom-background-media");
+    if (!media) return { ok: false, reason: "no background" };
+    /* Keep the readability panel in sync: it reports its own slider value on the
+       next interaction, so a stale slider would push the old dim back. */
+    const syncPanel = () => {
+      const panel = document.getElementById("codex-background-controls");
+      const root = panel && panel.shadowRoot;
+      if (!root) return;
+      const input = root.querySelector('input[type="range"]');
+      const output = root.querySelector("output");
+      if (percent === null) return;
+      if (input && input.value !== String(percent)) input.value = String(percent);
+      if (output) output.textContent = percent + "%";
+    };
+    let style = document.getElementById("codex-background-opacity-style");
+    if (percent === null) {
+      if (style) style.remove();
+      syncPanel();
+      return { ok: true, cleared: true };
+    }
+    if (!style) { style = document.createElement("style"); style.id = "codex-background-opacity-style"; document.head.append(style); }
+    style.textContent = "#codex-custom-background-media,#codex-custom-background-base,#codex-custom-background-base canvas{opacity:" + (percent / 100).toFixed(2) + " !important}";
+    media.setAttribute("data-background-opacity", String(percent / 100));
+    syncPanel();
+    return { ok: true, percent };
+  })()`);
 }
 
 function writePrefs(patch) {
@@ -259,6 +328,42 @@ function cors(res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
+/* External writers (tools, scripts, the self-test) change prefs over HTTP; the
+   page only learns about a change through the mirror pass in the main loop. This
+   holder is declared before the HTTP server starts so a request can never hit a
+   temporal-dead-zone reference. */
+const pendingMirrors = { appearance: false, library: false };
+
+const RESET_BACKGROUND_EXPRESSION = `(() => {
+  const loseGl = el => { try { const ctx = el && el.getContext ? (el.getContext("webgl2") || el.getContext("webgl")) : null; const ext = ctx && ctx.getExtension ? ctx.getExtension("WEBGL_lose_context") : null; if (ext) ext.loseContext(); } catch (e) {} };
+  const prewarm = window.__codexPrewarm;
+  if (prewarm && prewarm.instance) { try { prewarm.instance.destroy && prewarm.instance.destroy(); } catch (e) {} try { prewarm.instance.dispose && prewarm.instance.dispose(); } catch (e) {} }
+  window.__codexPrewarm = null;
+  for (const el of document.querySelectorAll("#codex-custom-background-base, #codex-custom-background-base-pending, #codex-custom-background-base-pending-hover")) {
+    const canvas = el.querySelector ? el.querySelector("canvas") : null;
+    if (canvas) loseGl(canvas);
+    el.remove();
+  }
+  for (const el of document.querySelectorAll("#codex-custom-background-media")) {
+    const url = el.getAttribute && el.getAttribute("data-object-url");
+    if (url) { try { URL.revokeObjectURL(url); } catch (e) {} }
+    if (el.tagName === "VIDEO") { try { el.pause(); } catch (e) {} }
+    el.remove();
+  }
+  const instance = window.__webwallglInstance;
+  if (instance) { try { instance.destroy && instance.destroy(); } catch (e) {} try { instance.unmount && instance.unmount(); } catch (e) {} try { instance.dispose && instance.dispose(); } catch (e) {} }
+  window.__webwallglInstance = null;
+  document.getElementById("codex-custom-background-style")?.remove();
+  document.getElementById("codex-custom-background-tune-style")?.remove();
+  document.getElementById("codex-background-opacity-style")?.remove();
+  document.getElementById("codex-wallpaper-shade")?.remove();
+  /* The dim/readability panel has nothing to control once the background is
+     gone; it is rebuilt by launchControls when a wallpaper returns. */
+  for (const id of ["codex-background-controls", "codex-background-readability", "codex-background-readability-style"]) { try { document.getElementById(id)?.remove(); } catch (e) {} }
+  window.__codexWallpaperBytes = null;
+  return { ok: true };
+})()`;
+
 async function acquireServer() {
   return await new Promise((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
@@ -294,6 +399,25 @@ async function acquireServer() {
             res.writeHead(404, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: "wallpaper not found" }));
           }
+        } else if (url.pathname === "/reset" || url.pathname === "/disable") {
+          /* /reset removes every background layer and stops the watchdog from
+             restoring the remembered wallpaper until a new selection arrives.
+             /disable only stops the restore, so the MCP server can inject a
+             custom file/URL background without the next tick tearing it down. */
+          const before = selection();
+          writeSelection(before.source, before.title, { disabled: true });
+          mediaCache.clear();
+          prewarm = null;
+          prewarmEpoch += 1;
+          rotationPending = null;
+          let pageResult = null;
+          if (url.pathname === "/reset") {
+            try { pageResult = await pageCommand(RESET_BACKGROUND_EXPRESSION, 15000); }
+            catch (error) { pageResult = { ok: false, error: String(error.message || error) }; }
+          }
+          log(url.pathname === "/reset" ? `background reset (selection disabled${pageResult && pageResult.ok === false ? ", page error: " + pageResult.error : ""})` : "background restore paused (selection disabled)");
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true, reset: url.pathname === "/reset", disabled: true, source: before.source, page: pageResult }));
         } else if (url.pathname === "/library") {
           if (req.method === "POST") {
             let parsed = null;
@@ -304,7 +428,7 @@ async function acquireServer() {
             } else {
               const library = writeLibrary(parsed.library === undefined ? parsed : parsed.library);
               /* external writers (tests, scripts) must reach the open picker too */
-              libraryMirrorPending = true;
+              pendingMirrors.library = true;
               log("library state written via http (hidden=" + library.hidden.length + ", rotation=" + library.rotation.enabled + ")");
               res.writeHead(200, { "content-type": "application/json" });
               res.end(JSON.stringify({ ok: true, library }));
@@ -312,6 +436,23 @@ async function acquireServer() {
           } else {
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify(libraryPayload(libraryState(), listWallpapers(), { rotation: rotationState() })));
+          }
+        } else if (url.pathname === "/opacity") {
+          /* Background dimming exposed to tools. ?value=clear removes the
+             override; 5..100 sets it. Applied immediately and remembered, so a
+             wallpaper switch re-applies it after the layer is rebuilt. */
+          const raw = url.searchParams.get("value");
+          const clear = raw === null || raw === "clear" || raw === "";
+          const percent = clear ? null : backgroundOpacityValueFor(raw);
+          if (!clear && percent === null) {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "value must be 5..100" }));
+          } else {
+            writePrefs({ backgroundOpacity: percent });
+            let applied = null;
+            try { applied = await applyBackgroundOpacity(percent); } catch (error) { applied = { ok: false, error: String(error.message || error) }; }
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, backgroundOpacity: percent, applied }));
           }
         } else if (url.pathname === "/white-text") {
           const enabled = url.searchParams.get("enabled") !== "false";
@@ -326,10 +467,36 @@ async function acquireServer() {
               res.writeHead(400, { "content-type": "application/json" });
               res.end(JSON.stringify({ ok: false, error: "expected a JSON object body" }));
             } else {
-              const appearance = writeAppearance(parsed.appearance === undefined ? parsed : parsed.appearance);
-              log("appearance prefs written via http (preset=" + appearance.activePreset + ")");
+              /* Three body shapes are accepted:
+                   1. { appearance: {...}, ...otherPrefs } - appearance replaced, other keys merged
+                   2. a bare appearance object (has glass/fonts/filters/ext/...)
+                   3. plain prefs only ({ whiteText | readability | backgroundOpacity })
+                 Shape 3 used to fall into writeAppearance() and silently reset the
+                 whole appearance block to factory defaults - a single dimming
+                 change wiped custom glass, fonts and filters. */
+              const appearanceShaped = value => value && typeof value === "object" && !Array.isArray(value)
+                && ["glass", "fonts", "filters", "ext", "presets", "activePreset", "version"].some(key => key in value);
+              const hasAppearance = parsed.appearance !== undefined || appearanceShaped(parsed);
+              let appearance = null;
+              if (hasAppearance) {
+                appearance = writeAppearance(parsed.appearance !== undefined ? parsed.appearance : parsed);
+                const rest = { ...parsed };
+                delete rest.appearance;
+                if (appearanceShaped(parsed) && parsed.appearance === undefined) {
+                  for (const key of ["glass", "fonts", "filters", "ext", "presets", "activePreset", "version"]) delete rest[key];
+                }
+                if (Object.keys(rest).length) writePrefs(rest);
+                pendingMirrors.appearance = true;
+                log("appearance prefs written via http (preset=" + appearance.activePreset + ")");
+              } else {
+                writePrefs(parsed);
+                /* A dim-only or readability-only write still has to reach the
+                   open panel, otherwise the page keeps showing the old values. */
+                if (parsed.backgroundOpacity !== undefined || parsed.readability !== undefined) pendingMirrors.appearance = true;
+                log("prefs written via http (" + Object.keys(parsed).join(",") + ")");
+              }
               res.writeHead(200, { "content-type": "application/json" });
-              res.end(JSON.stringify({ ok: true, appearance }));
+              res.end(JSON.stringify({ ok: true, appearance: appearance || appearanceState(), prefs: prefs() }));
             }
           } else {
             res.writeHead(200, { "content-type": "application/json" });
@@ -587,6 +754,12 @@ async function status() {
         const picker = document.getElementById("codex-wallpaper-picker");
         const command = picker?.dataset.command || "";
         if (picker) picker.dataset.command = "";
+        return command;
+      })(),
+      controlsCommand: (() => {
+        const controls = document.getElementById("codex-background-controls");
+        const command = (controls && controls.dataset.controlsCommand) || "";
+        if (controls) controls.dataset.controlsCommand = "";
         return command;
       })()
     }))()`,
@@ -1892,7 +2065,21 @@ let appearanceRunning = false;
 let appearanceLastError = null;
 function launchControls() {
   controlsRunning = true;
-  const child = spawn(process.execPath, [controlsScript], { windowsHide: true, cwd: root, stdio: "ignore" });
+  /* The panel is rebuilt after every wallpaper switch, so the saved dim and
+     readability values ride along through the environment; without them the new
+     panel would start at 100%/45% and overwrite what the user had chosen. */
+  const child = spawn(process.execPath, [controlsScript], {
+    windowsHide: true,
+    cwd: root,
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      LUNA_CONTROLS_STATE: JSON.stringify({
+        backgroundOpacity: backgroundOpacityValue(),
+        readability: readabilityState()
+      })
+    }
+  });
   child.once("error", error => { controlsRunning = false; log(`controls error: ${error.message}`); });
   child.once("exit", code => { controlsRunning = false; log(code === 0 ? "readability controls restored" : `controls exited ${code}`); });
 }
@@ -2297,6 +2484,8 @@ for (;;) {
          install only starts on the next full tick - the invisible 800ms wait. */
       current = selection();
     }
+    /* Reset state: no wallpaper until the user (or a tool) picks one again. */
+    const disabled = current.disabled === true;
     if (state.page && !!state.pickerOpen !== lastPickerOpen) {
       lastPickerOpen = !!state.pickerOpen;
       if (lastPickerOpen) { invalidateWallpaperCache(); mediaCache.clear(); prewarmSizes.clear(); log("picker opened: wallpaper library cache invalidated"); }
@@ -2309,9 +2498,10 @@ for (;;) {
         log(`appearance prefs saved via panel (preset=${saved.activePreset}, glass=${saved.glass.enabled})`);
       } catch (error) { appearanceLastError = "appearance command rejected: " + error.message; log(appearanceLastError); }
     }
-    if (state.page && (state.appearanceRefresh !== lastAppearanceRefresh || appearanceMirrorPending)) {
+    if (state.page && (state.appearanceRefresh !== lastAppearanceRefresh || appearanceMirrorPending || pendingMirrors.appearance)) {
       lastAppearanceRefresh = state.appearanceRefresh || "";
       appearanceMirrorPending = false;
+      pendingMirrors.appearance = false;
       /* Mirror the saved state back so the panel can honour "read on open" and a
          freshly uploaded avatar/mascot shows up without a reload. */
       const mirror = JSON.stringify({ t: Date.now(), appearance: appearanceState() });
@@ -2342,13 +2532,43 @@ for (;;) {
         log(`wallpaper props saved for ${id} (${applied && applied.ok ? "applied via " + applied.via : "not applied: " + ((applied && applied.via) || "no page")})`);
       } catch (error) { log("props command rejected: " + error.message); }
     }
-    if (state.page && (state.libraryRequest !== lastLibraryRequest || libraryMirrorPending)) {
+    if (state.page && (state.libraryRequest !== lastLibraryRequest || libraryMirrorPending || pendingMirrors.library)) {
       lastLibraryRequest = state.libraryRequest || "";
       libraryMirrorPending = false;
+      pendingMirrors.library = false;
       await mirrorLibrary();
     }
     if (state.page && state.uploadReady) await handleUpload(state.uploadReady);
     if (state.page && state.uploadDelete) await handleUploadDelete(state.uploadDelete);
+    /* ---- readability panel channel ----
+       The panel is rebuilt on every switch, so its values are saved here and fed
+       back in through launchControls(). A value equal to the stored one is a
+       no-op (the panel announces its initial state once on injection). */
+    if (state.page && state.controlsCommand) {
+      try {
+        const parsed = JSON.parse(state.controlsCommand);
+        const patch = {};
+        if (parsed && parsed.backgroundOpacity !== undefined) {
+          const percent = backgroundOpacityValueFor(parsed.backgroundOpacity);
+          if (percent !== null && percent !== backgroundOpacityValue()) {
+            patch.backgroundOpacity = percent;
+            if (percent !== 100) { try { await applyBackgroundOpacity(percent); } catch {} }
+            else { try { await pageCommand('document.getElementById("codex-background-opacity-style")?.remove(); true'); } catch {} }
+          }
+        }
+        if (parsed && parsed.readability && typeof parsed.readability === "object") {
+          const current = readabilityState();
+          const percent = Number(parsed.readability.percent);
+          const mode = READABILITY_MODES.includes(parsed.readability.mode) ? parsed.readability.mode : current.mode;
+          const next = {
+            percent: Number.isFinite(percent) ? Math.min(100, Math.max(0, Math.round(percent))) : current.percent,
+            mode
+          };
+          if (next.percent !== current.percent || next.mode !== current.mode) patch.readability = next;
+        }
+        if (Object.keys(patch).length) writePrefs(patch);
+      } catch (error) { log("controls command rejected: " + error.message); }
+    }
 
     /* ---- Phase 2: auto rotation ---- */
     let rotationTargetFromRotation = "";
@@ -2370,7 +2590,7 @@ for (;;) {
         rotationNextAt = Date.now() + library.rotation.intervalSec * 1000;
         rotationPending = null;
         log("rotation timer reset by manual pick");
-      } else if (!restoring && state.page && state.visibility === "visible" && !state.pickerOpen && Date.now() >= rotationNextAt) {
+      } else if (!restoring && !disabled && state.page && state.visibility === "visible" && !state.pickerOpen && Date.now() >= rotationNextAt) {
         const targetId = pickRotationTarget(current.source, library);
         if (targetId) {
           log("rotation -> " + targetId + " (order=" + library.rotation.order + ", candidates=" + rotationCandidates(current.source, library).length + ")");
@@ -2534,8 +2754,8 @@ for (;;) {
       if (info) startPrewarm(wantPrewarm, info);
     }
 
-    const needsBackground = state.page && !prewarmCommitted && (contextRecovery || !state.background || !state.base || state.source !== current.source);
-    const needsControls = state.page && (!state.readability || !state.controls);
+    const needsBackground = state.page && !disabled && !prewarmCommitted && (contextRecovery || !state.background || !state.base || state.source !== current.source);
+    const needsControls = state.page && !disabled && (!state.readability || !state.controls);
     const needsPicker = state.page && !state.picker;
     const needsAppearance = state.page && (!state.appearance || state.appearanceBuild !== APPEARANCE_BUILD);
     if (!restoring && (needsBackground || (needsControls && !controlsRunning) || (needsPicker && !pickerRunning) || (needsAppearance && !appearanceRunning))) {
@@ -2547,6 +2767,10 @@ for (;;) {
           if (bgResult && bgResult.renderMode === "aborted") log(`install aborted (superseded): ${current.source}`);
           else {
             log(`background installed: ${current.source}`);
+            /* Every install builds fresh layers, which drop the dimming style;
+               re-apply the saved override so a switch keeps the chosen opacity. */
+            const opacityOverride = backgroundOpacityValue();
+            if (opacityOverride !== null) { try { await applyBackgroundOpacity(opacityOverride); } catch {} }
             if (rotationTargetFromRotation && bgResult && bgResult.ok === false) {
               rotationFailed.set(current.source, Date.now());
               log(`rotation candidate ${current.source} failed; skipped for 10 minutes`);
