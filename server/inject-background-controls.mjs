@@ -34,12 +34,22 @@ const initialReadability = (() => {
   };
 })();
 const initialOpacity = (() => {
-  const raw = Number(initialState.backgroundOpacity);
-  return Number.isFinite(raw) ? Math.max(5, Math.min(100, Math.round(raw))) : null;
+  /* null means "no override", but Number(null) is 0 - treating that as a real
+     value clamped the wallpaper to the 5% floor, so the background was almost
+     invisible while every control still claimed 100%. */
+  const raw = initialState.backgroundOpacity;
+  if (raw === null || raw === undefined || raw === "") return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? Math.max(5, Math.min(100, Math.round(value))) : null;
 })();
 
 const target = await findPage();
 if (!target) throw new Error("Codex main page target not found");
+
+/* Bumped whenever this script changes. The host records the build it was created
+   with, so the watchdog can tell a stale panel from a current one and re-inject it
+   instead of leaving old behaviour in the page across an update. */
+const CONTROLS_BUILD = "0.3.2+panel-fixes.5";
 
 const socket = new WebSocket(target.webSocketDebuggerUrl);
 let nextId = 1;
@@ -77,6 +87,7 @@ const expression = `(() => {
   document.getElementById("codex-background-controls")?.remove();
   const host = document.createElement("div");
   host.id = "codex-background-controls";
+  host.dataset.controlsBuild = ${JSON.stringify(CONTROLS_BUILD)};
   host.style.cssText = "display:none!important;position:fixed;top:88px;right:22px;z-index:2147483647;pointer-events:none!important";
   const shadow = host.attachShadow({ mode: "open" });
   shadow.innerHTML = \`
@@ -184,8 +195,16 @@ const expression = `(() => {
     }
     let base = document.getElementById("codex-custom-background-base");
     if (!base) { base = document.createElement("div"); base.id = "codex-custom-background-base"; base.style.cssText = "position:fixed!important;inset:0!important;background:#000!important;z-index:0!important;pointer-events:none!important"; media.before(base); }
-    const opacityStyle = writeCss("codex-background-opacity-style", "#codex-custom-background-media,#codex-custom-background-base,#codex-custom-background-base canvas{opacity:" + percent / 100 + " !important}");
-    if (opacityStyle.parentNode !== document.head) document.head.append(opacityStyle);
+    /* Full opacity is the absence of an override. Leaving a 1.0 rule behind looked
+       harmless but kept a stale value available for the next injection to reuse. */
+    const existing = document.getElementById("codex-background-opacity-style");
+    if (percent >= 100) {
+      if (existing) existing.remove();
+      delete cssCache["codex-background-opacity-style"];
+    } else {
+      const opacityStyle = writeCss("codex-background-opacity-style", "#codex-custom-background-media,#codex-custom-background-base,#codex-custom-background-base canvas{opacity:" + percent / 100 + " !important}");
+      if (opacityStyle.parentNode !== document.head) document.head.append(opacityStyle);
+    }
     setAttr(media, "data-background-opacity", String(percent / 100));
     if (media.tagName === "VIDEO") media.play().catch(() => {});
     setText(status, percent === 100 ? "壁纸完全显示" : percent === 0 ? "背景已隐藏" : "已应用 " + percent + "%");
@@ -247,35 +266,41 @@ const expression = `(() => {
     clearStaleMarks(markedSurfaces, "data-codex-readability-surface", keep);
   }
 
-  function pastelTint(pixels) {
-    let red = 0;
-    let green = 0;
-    let blue = 0;
-    for (let index = 0; index < pixels.length; index += 4) {
-      red += pixels[index];
-      green += pixels[index + 1];
-      blue += pixels[index + 2];
-    }
-    const count = pixels.length / 4;
-    return [red / count, green / count, blue / count]
-      .map(value => Math.round(value * 0.34 + 255 * 0.66))
-      .join(",");
+/* Bubble and soft modes force white text, so the tint has to stay dark enough
+   to carry it. Mixing 66% toward white (the old behaviour) produced a near-white
+   bubble on any bright wallpaper - white text on a white panel. The tint now
+   keeps the wallpaper's hue but is normalised into a fixed luminance band, so the
+   panel always reads as dark frosted glass that echoes the picture. */
+function tintAt(pixels, targetLuminance) {
+  let red = 0;
+  let green = 0;
+  let blue = 0;
+  for (let index = 0; index < pixels.length; index += 4) {
+    red += pixels[index];
+    green += pixels[index + 1];
+    blue += pixels[index + 2];
   }
+  const count = pixels.length / 4;
+  /* A small neutral base keeps a pure-black wallpaper from sampling to 0, which
+     would make the bubble invisible rather than dark. */
+  const base = 26;
+  red = (red / count) * 0.5 + base * 0.5;
+  green = (green / count) * 0.5 + base * 0.5;
+  blue = (blue / count) * 0.5 + base * 0.5;
+  const luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+  const scale = targetLuminance / Math.max(1, luminance);
+  return [red, green, blue]
+    .map(value => Math.round(Math.min(255, Math.max(0, value * scale))))
+    .join(",");
+}
 
-  function deepTint(pixels) {
-    let red = 0;
-    let green = 0;
-    let blue = 0;
-    for (let index = 0; index < pixels.length; index += 4) {
-      red += pixels[index];
-      green += pixels[index + 1];
-      blue += pixels[index + 2];
-    }
-    const count = pixels.length / 4;
-    return [red / count, green / count, blue / count]
-      .map(value => Math.round(value * 0.40 + 10 * 0.60))
-      .join(",");
-  }
+function pastelTint(pixels) {
+  return tintAt(pixels, 78);
+}
+
+function deepTint(pixels) {
+  return tintAt(pixels, 34);
+}
 
   /* Sampling a frame costs ~25ms and every changed custom property on :root
      forces a full style recalculation (~95ms), so the old 500ms timer kept the
@@ -367,8 +392,24 @@ const expression = `(() => {
       "body[data-codex-readability-mode=soft] #root main[data-codex-readability-surface]{background:linear-gradient(105deg,rgba(var(--codex-bubble-shade-0,12,14,18)," + (softAlpha + 0.16).toFixed(3) + "),rgba(var(--codex-bubble-shade-1,10,12,16)," + (softAlpha + 0.08).toFixed(3) + ") 44%,rgba(var(--codex-bubble-shade-2,8,10,14)," + (softAlpha + 0.14).toFixed(3) + "))!important;border-radius:0!important}",
       "body[data-codex-readability-mode=soft] #root [data-codex-readability-surface=header]{background:none!important}",
       "body[data-codex-readability-mode=soft] #root [data-codex-readability-surface=composer]{background:linear-gradient(105deg,rgba(var(--codex-bubble-shade-0,12,14,18)," + (softAlpha + 0.24).toFixed(3) + "),rgba(var(--codex-bubble-shade-2,8,10,14)," + (softAlpha + 0.20).toFixed(3) + "))!important;border-radius:24px!important}",
-      "body[data-codex-readability-mode=bubble] #root [data-codex-readability-bubble]{position:relative!important;isolation:isolate!important;border-radius:28px!important;background:linear-gradient(105deg,rgba(var(--codex-bubble-tint-0,255,255,255)," + (bubbleAlpha + 0.04).toFixed(3) + "),rgba(var(--codex-bubble-tint-1,250,250,252)," + bubbleAlpha.toFixed(3) + ") 48%,rgba(var(--codex-bubble-tint-2,255,255,255)," + (bubbleAlpha + 0.03).toFixed(3) + "))!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important;border:0!important;box-shadow:0 12px 32px rgba(12,16,24," + (0.035 + strength * 0.09).toFixed(3) + "),inset 0 1px 0 rgba(255,255,255,.18)!important}",
+      /* The bubble used to be mixed 30-60% toward white, which is unreadable under
+         the forced white text - especially on the bright part of a picture. It now
+         uses the sampled *shade* (the dark counterpart of the tint) plus a real
+         backdrop blur, so text always sits on dark frosted glass that still carries
+         the wallpaper's hue. */
+      "body[data-codex-readability-mode=bubble] #root [data-codex-readability-bubble]{position:relative!important;isolation:isolate!important;border-radius:28px!important;background:linear-gradient(105deg,rgba(var(--codex-bubble-shade-0,12,14,18)," + (bubbleAlpha + 0.18).toFixed(3) + "),rgba(var(--codex-bubble-shade-1,10,12,16)," + (bubbleAlpha + 0.12).toFixed(3) + ") 48%,rgba(var(--codex-bubble-shade-2,8,10,14)," + (bubbleAlpha + 0.16).toFixed(3) + "))!important;backdrop-filter:blur(6px) saturate(115%)!important;-webkit-backdrop-filter:blur(6px) saturate(115%)!important;border:0!important;box-shadow:0 12px 32px rgba(12,16,24," + (0.035 + strength * 0.09).toFixed(3) + "),inset 0 1px 0 rgba(255,255,255,.18)!important}",
+      /* Bubble mode only styles the conversation bubbles, which left the sidebar
+         and top bar as bare white text straight on the wallpaper. On a bright
+         picture that is unreadable, so those two surfaces get the same dark
+         frosted treatment the soft mode uses. */
+      "body[data-codex-readability-mode=bubble] #root aside[data-codex-readability-surface],body[data-codex-readability-mode=bubble] #root [data-codex-readability-surface=topbar]{background:linear-gradient(100deg,rgba(var(--codex-bubble-shade-0,12,14,18)," + (softAlpha + 0.40).toFixed(3) + "),rgba(var(--codex-bubble-shade-1,10,12,16)," + (softAlpha + 0.34).toFixed(3) + "))!important;backdrop-filter:blur(10px) saturate(120%)!important;-webkit-backdrop-filter:blur(10px) saturate(120%)!important}",
       "body[data-codex-readability-mode=bubble] #root aside[data-codex-readability-bubble]{border-radius:0 28px 28px 0!important}",
+      /* Codex's own light theme paints main/_MainContentSurface_ with a 30% white
+         wash. Over a wallpaper it works like a milky film: the picture looks
+         faded and every forced-white label loses contrast. Clearing it lets the
+         wallpaper show at full strength; the per-bubble panels above are what
+         carry the text. Soft mode keeps its own gradient, which is intentional. */
+      "body[data-codex-readability-mode=bubble] #root main[class*='_MainContentSurface_'],body[data-codex-readability-mode=bubble] #root main[class*='_MainContentSurface_']>div,body[data-codex-readability-mode=bubble] #root [class*='_MainContentViewport_'],body[data-codex-readability-mode=bubble] #root [class*='_WorkspaceContent_']{background:transparent!important}",
       "body[data-codex-readability-mode=bubble] #root [data-codex-readability-bubble=composer]{border-radius:24px!important}",
       "body[data-codex-readability-mode=bubble] #root [data-codex-readability-bubble=user]{border-radius:18px!important}"
     ];
@@ -442,17 +483,11 @@ const expression = `(() => {
     window.__codexReadabilitySurfaceTimer = setTimeout(markReadabilitySurfaces, 250);
   });
   window.__codexReadabilityObserver.observe(document.body, { childList: true, subtree: true });
-  /* The saved pref is authoritative: the media element's recorded value can be
-     stale (a scene canvas has no attribute at all), and this panel is the only
-     writer of that attribute. */
+  /* The saved pref is authoritative and its absence means "no dim". Reading a
+     stale attribute off the media element is what kept a 5% dim alive across
+     reloads after the null-means-100% bug wrote 0.05 once. */
   const savedOpacity = ${initialOpacity === null ? "null" : initialOpacity};
-  const recordedOpacity = (() => {
-    const node = liveMedia();
-    if (!node) return null;
-    const value = Number(node.getAttribute("data-background-opacity"));
-    return Number.isFinite(value) ? value : null;
-  })();
-  apply(savedOpacity !== null ? savedOpacity : recordedOpacity !== null ? Math.round(recordedOpacity * 100) : 100);
+  apply(savedOpacity !== null ? savedOpacity : 100);
   shadow.querySelectorAll(".modes button").forEach(item => item.classList.toggle("active", item.dataset.mode === readabilityMode));
   applyReadability(${initialReadability.percent});
   return { ok: true, backgroundInstalled: !!liveMedia(), inlineControls: true, readability: "${initialReadability.mode}:${initialReadability.percent}", opacity: savedOpacity };

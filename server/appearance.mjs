@@ -29,6 +29,8 @@ export const FACE_LABELS = {
 };
 export const FACE_MODES = ["inherit", "custom", "off"];
 export const FACE_MODE_LABELS = { inherit: "\u8DDF\u968F\u5168\u5C40", custom: "\u72EC\u7ACB", off: "\u5173\u95ED" };
+export const PANEL_DOCKS = ["br", "tr", "bl", "tl", "free"];
+export const PANEL_LAYOUTS = ["stack", "wide"];
 
 /* Design limits for the extra frosted-glass selectors: at most 8 entries, each at
    most 120 characters. Anything longer, or past the eighth, is dropped whole - the
@@ -130,6 +132,9 @@ export function defaultAppearance() {
       scale: 100
     },
     ext: defaultExt(),
+    /* Where the 外观 panel sits and how wide it is. `dock` picks a corner; a drag
+       switches it to "free" and stores left/top in CSS pixels. */
+    ui: { dock: "br", left: null, top: null, width: 342, layout: "stack" },
     presets: []
   };
 }
@@ -269,6 +274,17 @@ export function normalizeAppearance(raw, options = {}) {
   out.ext.mascot.drag = mascotRaw.drag !== false;
   out.ext.mascot.file = text(mascotRaw.file).trim().slice(0, 120);
   out.ext.mascot.image = /^data:image\/(png|jpeg|webp);base64,/.test(text(mascotRaw.image)) ? text(mascotRaw.image) : "";
+  const uiRaw = isObject(raw.ui) ? raw.ui : {};
+  out.ui.dock = PANEL_DOCKS.includes(uiRaw.dock) ? uiRaw.dock : out.ui.dock;
+  out.ui.layout = PANEL_LAYOUTS.includes(uiRaw.layout) ? uiRaw.layout : out.ui.layout;
+  out.ui.width = num(uiRaw.width, 280, 640, out.ui.width);
+  /* left/top only matter for a free-floating panel; anything else is ignored so a
+     stale position can never strand the panel off screen. */
+  const left = Number(uiRaw.left);
+  const top = Number(uiRaw.top);
+  out.ui.left = Number.isFinite(left) ? Math.max(0, Math.min(10000, Math.round(left))) : null;
+  out.ui.top = Number.isFinite(top) ? Math.max(0, Math.min(10000, Math.round(top))) : null;
+  if (out.ui.dock === "free" && (out.ui.left === null || out.ui.top === null)) out.ui.dock = "br";
   out.activePreset = text(raw.activePreset).trim() ? text(raw.activePreset).trim().slice(0, 48) : out.activePreset;
   if (options.withPresets !== false) {
     const list = Array.isArray(raw.presets) ? raw.presets : [];
@@ -443,7 +459,7 @@ export function readAppearancePrefs(env = process.env) {
    page latched on window.__lunaAppearance and re-injects on a mismatch, which is what
    makes a watchdog restart after a code update take effect on a page that is already
    running an older runtime (the panel node alone cannot tell the two apart). */
-export const APPEARANCE_BUILD = "phase4+2026.10.18.1";
+export const APPEARANCE_BUILD = "0.3.2+panel-dock.6";
 const BUILD_TOKEN = "__LUNA_APPEARANCE_BUILD__";
 
 /* The page-side half. It is serialised with Function.prototype.toString() and evaluated
@@ -458,6 +474,11 @@ function pageRuntime() {
   const FACE_MODES = ["inherit", "custom", "off"];
   const FACE_MODE_LABELS = { inherit: "跟随全局", custom: "独立", off: "关闭" };
   const OBJECT_FITS = ["cover", "contain", "fill"];
+  /* The page runtime is serialized with toString() and re-created inside the page,
+     so it only sees what this function declares. Module-level constants are NOT in
+     scope there - referencing one throws a ReferenceError on the first apply(). */
+  const PANEL_DOCKS = ["br", "tr", "bl", "tl", "free"];
+  const PANEL_LAYOUTS = ["stack", "wide"];
   const MAX_EXTRA_SELECTORS = 8;
   const MAX_EXTRA_SELECTOR_LENGTH = 120;
   const EXT_FORMS = ["whale", "cat", "rabbit", "fox", "penguin", "robot"];
@@ -855,7 +876,21 @@ function pageRuntime() {
     ".chip:hover{background:rgba(30,50,80,.95)}",
     ".panel{pointer-events:auto;display:none;position:absolute;right:0;bottom:54px;width:min(342px,calc(100vw - 44px));max-height:min(74vh,660px);flex-direction:column;border:1px solid rgba(255,255,255,.18);border-radius:16px;background:rgba(8,13,24,.96);box-shadow:0 18px 55px #0009;overflow:hidden}",
     ".panel.open{display:flex}",
-    ".head{display:flex;justify-content:space-between;align-items:center;padding:12px 14px 10px;border-bottom:1px solid rgba(255,255,255,.1)}",
+    /* Free-floating mode: the panel leaves the chip's stacking box and is placed
+       from saved viewport coordinates, so it can sit anywhere the user drags it. */
+    ".panel.free{position:fixed;right:auto;bottom:auto}",
+    ".panel.wide{width:min(720px,calc(100vw - 32px))}",
+    /* Two equal columns. At 720px each column is ~344px - the same width the
+       single-column panel always used - so no section needs to span, and spanning
+       only left a hole in the first row. */
+    ".panel.wide .body{display:grid;grid-template-columns:1fr 1fr;column-gap:16px;align-items:start}",
+    ".panel.wide .body>details{align-self:start;min-width:0}",
+    ".panel.wide .body>*{min-width:0}",
+    ".panel.wide .row label{white-space:normal;word-break:keep-all}",
+    ".head{display:flex;justify-content:space-between;align-items:center;padding:12px 14px 10px;border-bottom:1px solid rgba(255,255,255,.1);cursor:move;user-select:none;touch-action:none}",
+    ".head .tools{display:flex;align-items:center;gap:6px}",
+    ".dockbtn{width:26px;height:26px;border:1px solid rgba(255,255,255,.16);border-radius:8px;background:rgba(255,255,255,.06);color:#dbe7f7;cursor:pointer;font:700 12px/1 inherit;padding:0}",
+    ".dockbtn.on{background:rgba(56,189,248,.4);border-color:rgba(125,211,252,.75);color:#fff}",
     ".title{font:700 14px/1 inherit}",
     ".close{width:26px;height:26px;border:0;border-radius:8px;background:rgba(255,255,255,.14);color:#fff;cursor:pointer;font:700 14px/1 inherit}",
     ".body{overflow:auto;padding:6px 14px 2px}",
@@ -902,7 +937,13 @@ function pageRuntime() {
   const PANEL_SHELL = [
     "<button class=\"chip\" id=\"chip\">外观</button>",
     "<div class=\"panel\" id=\"panel\">",
-    "<div class=\"head\"><div class=\"title\">外观 · 液态玻璃</div><button class=\"close\" id=\"close\">\u00d7</button></div>",
+    "<div class=\"head\" id=\"head\"><div class=\"title\">外观 · 液态玻璃</div>",
+    "<div class=\"tools\">",
+    "<button class=\"dockbtn\" id=\"dock-br\" title=\"切换停靠位置（右下 / 右上 / 左下 / 左上）\">◱</button>",
+    "<button class=\"dockbtn\" id=\"dock-tl\" title=\"恢复默认位置与布局\">⌂</button>",
+    "<button class=\"dockbtn\" id=\"dock-layout\" title=\"切换布局（单列/双列）\">▥</button>",
+    "<button class=\"close\" id=\"close\">\u00d7</button>",
+    "</div></div>",
     "<div class=\"body\" id=\"body\"></div>",
     "<div class=\"msg\" id=\"msg\"></div>",
     "</div>"
@@ -1636,6 +1677,7 @@ function pageRuntime() {
         avatar: { enabled: false, size: 40, radius: 50, file: "", image: "" },
         mascot: { enabled: false, form: "whale", scale: 1, x: 96, y: 92, drag: true, file: "", image: "" }
       },
+      ui: { dock: "br", left: null, top: null, width: 342, layout: "stack" },
       presets: []
     };
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
@@ -1752,6 +1794,15 @@ function pageRuntime() {
     out.ext.mascot.drag = mascotRaw.drag !== false;
     out.ext.mascot.file = str(mascotRaw.file).slice(0, 120);
     out.ext.mascot.image = /^data:image\/(png|jpeg|webp);base64,/.test(str(mascotRaw.image)) ? str(mascotRaw.image) : "";
+    const uiRaw = raw.ui && typeof raw.ui === "object" && !Array.isArray(raw.ui) ? raw.ui : {};
+    out.ui.dock = PANEL_DOCKS.indexOf(uiRaw.dock) >= 0 ? uiRaw.dock : out.ui.dock;
+    out.ui.layout = PANEL_LAYOUTS.indexOf(uiRaw.layout) >= 0 ? uiRaw.layout : out.ui.layout;
+    out.ui.width = num(uiRaw.width, 280, 640, out.ui.width);
+    const left = Number(uiRaw.left);
+    const top = Number(uiRaw.top);
+    out.ui.left = Number.isFinite(left) ? Math.max(0, Math.min(10000, Math.round(left))) : null;
+    out.ui.top = Number.isFinite(top) ? Math.max(0, Math.min(10000, Math.round(top))) : null;
+    if (out.ui.dock === "free" && (out.ui.left === null || out.ui.top === null)) out.ui.dock = "br";
     if (withPresets) {
       const list = Array.isArray(raw.presets) ? raw.presets : [];
       for (const entry of list) {
@@ -1783,6 +1834,149 @@ function pageRuntime() {
     renderFonts(body);
     renderFilters(body);
     renderExt(body);
+
+    /* ---------- panel placement ----------
+       The panel used to be welded to the chip's corner with one fixed width and a
+       single stacked column, which is what made a 40-control panel feel cramped.
+       Now the header is a drag handle, the dock buttons snap it to a corner, the
+       layout button switches to a two-column (wider) layout, and the docker
+       remembers all of it in appearance.ui. */
+    /* ---------- drag / dock ---------- */
+    const head = shadow.getElementById("head");
+    const dockBr = shadow.getElementById("dock-br");
+    const dockTl = shadow.getElementById("dock-tl");
+    const layoutButton = shadow.getElementById("dock-layout");
+    /* The panel can be mounted before an apply() in scripted use; give the
+       placement code a complete ui block instead of throwing on undefined. */
+    if (!state) state = normalize({});
+    if (!state.ui) state.ui = { dock: "br", left: null, top: null, width: 342, layout: "stack" };
+
+    const clampIntoViewport = () => {
+      const rect = panel.getBoundingClientRect();
+      const maxLeft = Math.max(0, window.innerWidth - rect.width - 8);
+      const maxTop = Math.max(0, window.innerHeight - 48);
+      state.ui.left = Math.round(Math.min(maxLeft, Math.max(8, Number(state.ui.left) || 0)));
+      state.ui.top = Math.round(Math.min(maxTop, Math.max(8, Number(state.ui.top) || 0)));
+    };
+
+    const applyPlacement = () => {
+      const ui = state.ui || {};
+      const free = ui.dock === "free";
+      panel.classList.toggle("free", free);
+      panel.classList.toggle("wide", ui.layout === "wide");
+      const width = Math.round(Number(ui.width) || 342);
+      panel.style.width = "min(" + width + "px, calc(100vw - 32px))";
+      /* Every dock is viewport-anchored. Anchoring to the chip's own box meant the
+         panel could only ever appear in the bottom-right corner, so the other dock
+         buttons looked dead. */
+      const gap = 12;
+      const bottomGap = 118;
+      const place = (left, top) => {
+        panel.style.position = "fixed";
+        panel.style.left = left;
+        panel.style.top = top;
+        panel.style.right = "auto";
+        panel.style.bottom = "auto";
+      };
+      if (free) {
+        if (ui.left === null || ui.top === null) {
+          /* First drag before any saved point: start from where the panel is now,
+             so it does not jump to the top-left corner. */
+          const rect = panel.getBoundingClientRect();
+          state.ui.left = Math.round(rect.left);
+          state.ui.top = Math.round(rect.top);
+        }
+        clampIntoViewport();
+        place(state.ui.left + "px", state.ui.top + "px");
+      } else {
+        const top = ui.dock === "tl" || ui.dock === "tr" ? gap : "auto";
+        const bottom = ui.dock === "bl" || ui.dock === "br" ? bottomGap : "auto";
+        const left = ui.dock === "tl" || ui.dock === "bl" ? gap : "auto";
+        const right = ui.dock === "tr" || ui.dock === "br" ? 22 : "auto";
+        place(left === "auto" ? "auto" : left + "px", top === "auto" ? "auto" : top + "px");
+        panel.style.right = right === "auto" ? "auto" : right + "px";
+        panel.style.bottom = bottom === "auto" ? "auto" : bottom + "px";
+      }
+      dockBr.classList.toggle("on", ui.dock !== "free");
+      dockBr.textContent = ui.dock === "tr" ? "◳" : ui.dock === "bl" ? "◲" : ui.dock === "tl" ? "◰" : "◱";
+      dockBr.title = "切换停靠位置（右下 / 右上 / 左下 / 左上，共 4 个）";
+      layoutButton.classList.toggle("on", ui.layout === "wide");
+      layoutButton.title = ui.layout === "wide" ? "切换为单列布局" : "切换为双列宽面板";
+    };
+
+    /* One button cycles the four corners; the other toggles a two-column layout. */
+    const DOCK_ORDER = ["br", "tr", "bl", "tl"];
+    dockBr.addEventListener("click", () => {
+      const index = DOCK_ORDER.indexOf(state.ui.dock);
+      state.ui.dock = DOCK_ORDER[(index + 1) % DOCK_ORDER.length] || "br";
+      applyPlacement();
+      debouncedSave();
+    });
+    dockTl.addEventListener("click", () => {
+      /* The second button is a quick "put it back where it started" reset: bottom
+         right, single column, default width. */
+      state.ui.dock = "br";
+      state.ui.layout = "stack";
+      state.ui.width = 342;
+      state.ui.left = null;
+      state.ui.top = null;
+      applyPlacement();
+      debouncedSave();
+    });
+    layoutButton.addEventListener("click", () => {
+      state.ui.layout = state.ui.layout === "wide" ? "stack" : "wide";
+      state.ui.width = state.ui.layout === "wide" ? 720 : 342;
+      applyPlacement();
+      debouncedSave();
+    });
+
+    /* Drag by the header. A plain click on the header must still do nothing, so
+       the drag only starts once the pointer actually moved a few pixels. */
+    const drag = { active: false, dx: 0, dy: 0 };
+    const endDrag = event => {
+      if (!drag.active) return;
+      drag.active = false;
+      try { head.releasePointerCapture(event.pointerId); } catch {}
+      document.removeEventListener("pointermove", onDragMove, true);
+      document.removeEventListener("pointerup", endDrag, true);
+      document.removeEventListener("pointercancel", endDrag, true);
+      debouncedSave();
+    };
+    const onDragMove = event => {
+      if (!drag.active) return;
+      const left = event.clientX - drag.dx;
+      const top = event.clientY - drag.dy;
+      state.ui.dock = "free";
+      state.ui.left = left;
+      state.ui.top = top;
+      panel.classList.add("free");
+      panel.style.right = "auto";
+      panel.style.bottom = "auto";
+      clampIntoViewport();
+      panel.style.left = state.ui.left + "px";
+      panel.style.top = state.ui.top + "px";
+    };
+    head.addEventListener("pointerdown", event => {
+      if (event.button !== 0) return;
+      if (event.target && event.target.closest && event.target.closest("button")) return;
+      const rect = panel.getBoundingClientRect();
+      drag.active = true;
+      drag.dx = event.clientX - rect.left;
+      drag.dy = event.clientY - rect.top;
+      try { head.setPointerCapture(event.pointerId); } catch {}
+      document.addEventListener("pointermove", onDragMove, true);
+      document.addEventListener("pointerup", endDrag, true);
+      document.addEventListener("pointercancel", endDrag, true);
+      event.preventDefault();
+    });
+
+    /* Keep a floating panel reachable when the window shrinks. */
+    window.addEventListener("resize", () => { if (state && state.ui && state.ui.dock === "free") { clampIntoViewport(); applyPlacement(); } });
+
+    const placementSync = () => { if (state && state.ui) applyPlacement(); };
+    syncers.push(placementSync);
+    placementSync();
+
     /* The mascot lives in the page runtime; a drag hands its new position back so the
        panel persists it through the same debounced save as every slider. */
     try {
@@ -1849,6 +2043,9 @@ function pageRuntime() {
       panel.classList.toggle("open", open);
       chip.style.display = open ? "none" : "";
       if (!open) return;
+      /* The body keeps its scroll offset between openings; without this the panel
+         reopened halfway down (often at the very bottom) instead of at the top. */
+      body.scrollTop = 0;
       /* Reading the saved configuration on open: the page cannot fetch (CSP), so it asks
          the watchdog through a dataset attribute and adopts whatever comes back. */
       awaiting = true;
@@ -1915,7 +2112,8 @@ function pageRuntime() {
       shade: state ? Number(shadeAlpha(state).toFixed(3)) : 0,
       styles: ["codex-glass-style", "codex-font-style", "codex-filter-style"].filter(id => !!document.getElementById(id)),
       economy: economyOn(),
-      panel: !!document.getElementById(HOST_ID)
+      panel: !!document.getElementById(HOST_ID),
+      ui: state ? { dock: state.ui.dock, layout: state.ui.layout, width: state.ui.width, left: state.ui.left, top: state.ui.top } : null
     }),
     events: () => (window.__codexAppearanceLog || []).slice()
   };

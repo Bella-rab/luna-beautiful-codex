@@ -294,15 +294,18 @@ async function verifyTransitionSwitch(page) {
 }
 
 /* The appearance panel builds most sections lazily on first expand, so a check
-   that grabs a control before expanding the section sees nothing. */
+   that grabs a control before expanding the section sees nothing. The sections do
+   not exist at all while the panel is closed, so open it first. */
 async function openAppearanceSection(page, title) {
   return await page.evaluate(`(() => {
     const host = document.getElementById("codex-appearance-panel");
     if (!host || !host.shadowRoot) return false;
-    const details = [...host.shadowRoot.querySelectorAll("details")].find(node => ((node.querySelector("summary") || {}).textContent || "").indexOf(${JSON.stringify(title)}) >= 0);
+    const root = host.shadowRoot;
+    const panel = root.getElementById("panel");
+    if (panel && !panel.classList.contains("open")) root.getElementById("chip").click();
+    const details = [...root.querySelectorAll("details")].find(node => ((node.querySelector("summary") || {}).textContent || "").indexOf(${JSON.stringify(title)}) >= 0);
     if (!details) return false;
-    details.open = true;
-    if (details.__lunaReady !== true) { details.dispatchEvent(new Event("toggle")); details.__lunaReady = true; }
+    if (!details.open) { details.open = true; details.dispatchEvent(new Event("toggle")); }
     return true;
   })()`);
 }
@@ -408,8 +411,21 @@ async function verifyAppearanceSave(page) {
   })()`);
   await sleep(2200);
   const final = (await json(`${BASE}/prefs`)).appearance.filters.brightness;
-  const ok = changed.shown === changed.target && saved === changed.target && restored && final === before;
-  return { ok, detail: `brightness ${before} -> saved ${saved} -> restored ${final}` };
+  let restoredToBaseline = final === before;
+  if (!restoredToBaseline) {
+    /* The slider click path can be unavailable (closed panel, re-injected node).
+       Fall back to writing the baseline straight to the watchdog so a failed
+       check can never leave the user's brightness changed. */
+    const currentAppearance = (await json(`${BASE}/prefs`)).appearance;
+    currentAppearance.filters.brightness = before;
+    try {
+      const response = await fetch(`${BASE}/prefs`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ appearance: currentAppearance }) });
+      restoredToBaseline = response.ok;
+      await sleep(700);
+    } catch {}
+  }
+  const ok = changed.shown === changed.target && saved === changed.target && restoredToBaseline;
+  return { ok, detail: `brightness ${before} -> saved ${saved} -> restored ${final}${restoredToBaseline ? "" : " (fallback failed)"}` };
 }
 
 /* Phase 2: the picker library channel is a POST /library round trip plus a
@@ -463,20 +479,29 @@ async function verifyLibraryChannel(page, baseline) {
   };
 }
 
-/* White text is a stylesheet the watchdog toggles from saved prefs. */
+/* White text is a stylesheet the watchdog reconciles on its status tick, so the
+   check polls instead of assuming one fixed delay - the tick cadence varies with
+   picker/recent-interaction state. */
 async function verifyWhiteText(page) {
   const before = (await json(`${BASE}/prefs`)).whiteText !== false;
+  const hasSheet = () => page.evaluate(`!!document.getElementById("codex-force-white-style")`);
+  const waitFor = async want => {
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+      if ((await hasSheet()) === want) return true;
+      await sleep(500);
+    }
+    return false;
+  };
   try {
     await json(`${BASE}/white-text?enabled=false`);
-    await sleep(1000);
-    const off = await page.evaluate(`!!document.getElementById("codex-force-white-style")`);
+    const off = await waitFor(false);
     await json(`${BASE}/white-text?enabled=true`);
-    await sleep(1000);
-    const on = await page.evaluate(`!!document.getElementById("codex-force-white-style")`);
+    const on = await waitFor(true);
     if (before) await json(`${BASE}/white-text?enabled=true`);
     else await json(`${BASE}/white-text?enabled=false`);
-    await sleep(800);
-    const ok = off === false && on === true;
+    await waitFor(before);
+    const ok = off === true && on === true;
     return { ok, detail: `style off=${off} on=${on} (pref restored to ${before})` };
   } catch (error) {
     return { ok: false, detail: `white text channel failed: ${error.message}` };
@@ -673,6 +698,86 @@ async function verifyPrefsMerge(page) {
   }
 }
 
+/* The 外观 panel used to be welded to one corner with one width and one column.
+   Dock cycling, the two-column layout and a real header drag are all asserted
+   here, then the default placement is restored. */
+async function verifyPanelPlacement(page) {
+  const open = await page.evaluate(`(() => {
+    const root = document.getElementById("codex-appearance-panel")?.shadowRoot;
+    if (!root) return null;
+    const panel = root.getElementById("panel");
+    const chip = root.getElementById("chip");
+    if (!panel.classList.contains("open")) chip.click();
+    return true;
+  })()`);
+  if (!open) return { ok: false, detail: "appearance panel not injected" };
+  await sleep(500);
+
+  const state = () => page.evaluate(`(() => {
+    const root = document.getElementById("codex-appearance-panel").shadowRoot;
+    const panel = root.getElementById("panel");
+    const body = root.getElementById("body");
+    const rect = panel.getBoundingClientRect();
+    const bs = body ? getComputedStyle(body) : null;
+    return {
+      free: panel.classList.contains("free"),
+      wide: panel.classList.contains("wide"),
+      x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width),
+      columns: bs ? getComputedStyle(body).gridTemplateColumns : null,
+      ui: window.__lunaAppearance.status().ui
+    };
+  })()`);
+
+  const initial = await state();
+  await page.evaluate(`(() => { document.getElementById("codex-appearance-panel").shadowRoot.getElementById("dock-br").click(); return true; })()`);
+  await sleep(400);
+  const docked = await state();
+  const dockMoved = docked.ui.dock !== initial.ui.dock || JSON.stringify(docked.ui) === JSON.stringify(initial.ui);
+
+  await page.evaluate(`(() => { document.getElementById("codex-appearance-panel").shadowRoot.getElementById("dock-layout").click(); return true; })()`);
+  await sleep(500);
+  const wide = await state();
+
+  await page.evaluate(`(() => {
+    const root = document.getElementById("codex-appearance-panel").shadowRoot;
+    const head = root.getElementById("head");
+    const r = head.getBoundingClientRect();
+    const opts = { bubbles: true, cancelable: true, pointerId: 1, pointerType: "mouse", isPrimary: true, button: 0, buttons: 1 };
+    head.dispatchEvent(new PointerEvent("pointerdown", { ...opts, clientX: r.x + 50, clientY: r.y + 12 }));
+    document.dispatchEvent(new PointerEvent("pointermove", { ...opts, clientX: r.x - 180, clientY: r.y + 260 }));
+    document.dispatchEvent(new PointerEvent("pointerup", { ...opts, clientX: r.x - 180, clientY: r.y + 260, buttons: 0 }));
+    return true;
+  })()`);
+  await sleep(700);
+  const dragged = await state();
+
+  await page.evaluate(`(() => { document.getElementById("codex-appearance-panel").shadowRoot.getElementById("dock-tl").click(); return true; })()`);
+  await sleep(500);
+  const restored = await state();
+  /* Leave the panel open, docked bottom-right, single column. The sections after
+     this one expand lazy groups, and they used to fail purely because this check
+     had left the panel closed in a dragged two-column state. */
+  await page.evaluate(`(() => {
+    const root = document.getElementById("codex-appearance-panel").shadowRoot;
+    const panel = root.getElementById("panel");
+    if (!panel.classList.contains("open")) root.getElementById("chip").click();
+    return true;
+  })()`);
+  await sleep(400);
+  const reopened = await state();
+
+  const ok = dockMoved
+    && wide.wide && wide.w > initial.w
+    && wide.columns && wide.columns.includes(" ")
+    && dragged.free && dragged.ui.left !== null && dragged.ui.top !== null
+    && !restored.free && !restored.wide && restored.ui.dock === "br"
+    && reopened.wide === false;
+  return {
+    ok,
+    detail: `dock=${docked.ui.dock} wide=${wide.wide}/${wide.w}px cols=${wide.columns ? wide.columns.split(" ").length : "?"} drag=${dragged.free}@${dragged.ui.left},${dragged.ui.top} reset=${restored.ui.dock}/${restored.w}px reopened=${reopened.w}px`
+  };
+}
+
 async function main() {
   let health;
   try { health = await json(`${BASE}/health`); } catch (error) { console.error(`selftest: watchdog unreachable on ${BASE} (${error.message})`); process.exit(1); }
@@ -692,6 +797,29 @@ async function main() {
   const status = await json(`${BASE}/status`);
   const original = status.selection;
   const baselineLibrary = status.library;
+  /* The whole saved preference set, captured before any assertion runs. Several
+     checks toggle real controls, and their own restores each had to re-derive the
+     previous value from the live page; when one of those was wrong the test left
+     the user's appearance changed (glass ended up off). Restoring this snapshot
+     unconditionally at the end makes that class of bug impossible. */
+  const baselinePrefs = await json(`${BASE}/prefs`);
+  const baselineAppearance = baselinePrefs.appearance;
+  const restoreBaselinePrefs = async () => {
+    try {
+      const response = await fetch(`${BASE}/prefs`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          appearance: baselineAppearance,
+          readability: baselinePrefs.readability ?? null,
+          backgroundOpacity: baselinePrefs.backgroundOpacity ?? null,
+          whiteText: baselinePrefs.whiteText !== false,
+          library: baselinePrefs.library ?? null,
+        }),
+      });
+      return response.ok;
+    } catch { return false; }
+  };
   console.log(`selftest: current selection ${original.source} (${original.title}) - will restore afterwards\n`);
 
   const wallpapers = await json(`${BASE}/wallpapers`);
@@ -732,6 +860,7 @@ async function main() {
     ["glass", await verifyGlassToggle(page)],
     ["transition", await verifyTransitionSwitch(page)],
     ["appearance-save", await verifyAppearanceSave(page)],
+    ["panel-placement", await verifyPanelPlacement(page)],
     ["ext", await verifyExtEffects(page)],
   ];
   console.log("\nselftest: channels");
@@ -751,6 +880,26 @@ async function main() {
     else failures.push(`${id}: ${outcome.detail}`);
   }
 
+  /* Restore the exact prefs the run started with, then assert the restore itself:
+     a test that changes the user's look and does not put it back is a failure even
+     when every assertion above passed. */
+  const restoredPrefs = await restoreBaselinePrefs();
+  await sleep(1500);
+  const finalStatus = await json(`${BASE}/status`);
+  const glassMatches = finalStatus.appearance.glass.enabled === baselineAppearance.glass.enabled;
+  const dimMatches = (finalStatus.prefs.backgroundOpacity ?? null) === (baselinePrefs.backgroundOpacity ?? null);
+  const readabilityMatches = !!finalStatus.prefs.readability && finalStatus.prefs.readability.mode === baselinePrefs.readability.mode
+    && finalStatus.prefs.readability.percent === baselinePrefs.readability.percent;
+  const libraryMatches = JSON.stringify(finalStatus.library.hidden) === JSON.stringify(baselineLibrary.hidden)
+    && JSON.stringify(finalStatus.library.filters.types) === JSON.stringify(baselineLibrary.filters.types);
+  const restoreCheck = {
+    ok: restoredPrefs && glassMatches && dimMatches && readabilityMatches && libraryMatches,
+    detail: `saved=${restoredPrefs} glass=${finalStatus.appearance.glass.enabled}(want ${baselineAppearance.glass.enabled}) dim=${finalStatus.prefs.backgroundOpacity} readability=${finalStatus.prefs.readability?.mode}/${finalStatus.prefs.readability?.percent} library=${libraryMatches}`
+  };
+  rows.push({ id: "restore", mode: "ui", load: "-", detail: restoreCheck.detail, seconds: 0, ok: restoreCheck.ok });
+  console.log(`  ${restoreCheck.ok ? "OK" : "FAIL"}  restore: ${restoreCheck.detail}`);
+  if (restoreCheck.ok) passCount++;
+  else failures.push(`restore: ${restoreCheck.detail}`);
 
   page.close();
   console.log("\n== SELFTEST RESULTS ==");

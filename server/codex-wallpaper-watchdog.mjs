@@ -17,6 +17,9 @@ const pickerScript = path.join(root, "inject-wallpaper-picker.mjs");
 const appearanceScript = path.join(root, "inject-appearance.mjs");
 const logPath = path.join(root, "codex-wallpaper-watchdog.log");
 const lockPort = 43310;
+/* Must match inject-background-controls.mjs; a mismatch makes the watchdog
+   re-inject the panel once so a code update reaches the live page. */
+const CONTROLS_BUILD = "0.3.2+panel-fixes.5";
 const devtoolsPorts = [9229, 9230, 9231, 9232, 9233, 9234, 9235, 9236, 9237, 9238, 9239];
 const chunkSize = 512 * 1024;
 
@@ -671,6 +674,10 @@ async function status() {
       source: document.getElementById("codex-custom-background-media")?.getAttribute("data-wallpaper-source") || null,
       readability: !!document.getElementById("codex-background-readability"),
       controls: !!document.getElementById("codex-background-controls"),
+      controlsBuild: (() => {
+        const node = document.getElementById("codex-background-controls");
+        return (node && node.dataset && node.dataset.controlsBuild) || "";
+      })(),
       appearance: !!document.getElementById("codex-appearance-panel"),
       /* The panel node survives a code update, so the injected runtime carries its own
          build id; a mismatch forces one re-injection instead of leaving the old page half
@@ -2604,9 +2611,15 @@ for (;;) {
         rotationNextAt = Date.now() + library.rotation.intervalSec * 1000;
       }
     }
-    if (state.page && preference.whiteText && !state.whiteText && lastWhite !== true) { await applyWhiteText(); lastWhite = true; }
-    else if (state.page && !preference.whiteText && state.whiteText && lastWhite !== false) { await removeWhiteText(); lastWhite = false; }
-    else if (!state.page) { lastWhite = null; }
+    /* Reconcile against the page itself, not a cached flag. lastWhite assumed the
+       page could only change through this loop, so anything else touching the
+       sheet (a re-injection, a script, a leftover from an older build) desynced
+       white text permanently: the flag said "already applied" while the page
+       disagreed. /status already reports state.whiteText, so this costs nothing. */
+    if (state.page) {
+      if (preference.whiteText && !state.whiteText) { await applyWhiteText(); lastWhite = true; }
+      else if (!preference.whiteText && state.whiteText) { await removeWhiteText(); lastWhite = false; }
+    } else { lastWhite = null; }
     if (state.page && state.deferredUpgrade) { lastDeferredUpgrade = state.deferredUpgrade; log(`deferred webgl upgrade ${current.source}: result=${state.deferredUpgrade.result}${state.deferredUpgrade.lastDiag ? " lastDiag=" + String(state.deferredUpgrade.lastDiag).slice(0, 160) : ""}`); }
     if (!current.source) { await wait(5000); continue; }
 
@@ -2755,7 +2768,11 @@ for (;;) {
     }
 
     const needsBackground = state.page && !disabled && !prewarmCommitted && (contextRecovery || !state.background || !state.base || state.source !== current.source);
-    const needsControls = state.page && !disabled && (!state.readability || !state.controls);
+    /* A controls panel injected by an older build keeps running its old logic
+       forever otherwise (that is how a 5% dim survived a fix). Re-inject once when
+       the build id changes. */
+    const controlsStale = state.page && (state.controls || state.readability) && state.controlsBuild !== CONTROLS_BUILD;
+    const needsControls = state.page && !disabled && (!state.readability || !state.controls || controlsStale);
     const needsPicker = state.page && !state.picker;
     const needsAppearance = state.page && (!state.appearance || state.appearanceBuild !== APPEARANCE_BUILD);
     if (!restoring && (needsBackground || (needsControls && !controlsRunning) || (needsPicker && !pickerRunning) || (needsAppearance && !appearanceRunning))) {
@@ -2768,9 +2785,10 @@ for (;;) {
           else {
             log(`background installed: ${current.source}`);
             /* Every install builds fresh layers, which drop the dimming style;
-               re-apply the saved override so a switch keeps the chosen opacity. */
-            const opacityOverride = backgroundOpacityValue();
-            if (opacityOverride !== null) { try { await applyBackgroundOpacity(opacityOverride); } catch {} }
+               re-apply the saved override so a switch keeps the chosen opacity.
+               With no saved override the stale sheet (and the 5% dim an older
+               build could leave behind) is removed instead. */
+            try { await applyBackgroundOpacity(backgroundOpacityValue()); } catch {}
             if (rotationTargetFromRotation && bgResult && bgResult.ok === false) {
               rotationFailed.set(current.source, Date.now());
               log(`rotation candidate ${current.source} failed; skipped for 10 minutes`);
