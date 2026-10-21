@@ -135,6 +135,9 @@ export function defaultAppearance() {
     /* Where the 外观 panel sits and how wide it is. `dock` picks a corner; a drag
        switches it to "free" and stores left/top in CSS pixels. */
     ui: { dock: "br", left: null, top: null, width: 342, layout: "stack" },
+    /* Snapshot taken right before a preset was applied, so 关闭预设 can put the
+       user's own look back instead of leaving them to rebuild it by hand. */
+    presetUndo: null,
     presets: []
   };
 }
@@ -285,6 +288,13 @@ export function normalizeAppearance(raw, options = {}) {
   out.ui.left = Number.isFinite(left) ? Math.max(0, Math.min(10000, Math.round(left))) : null;
   out.ui.top = Number.isFinite(top) ? Math.max(0, Math.min(10000, Math.round(top))) : null;
   if (out.ui.dock === "free" && (out.ui.left === null || out.ui.top === null)) out.ui.dock = "br";
+  /* A stored undo snapshot is only trusted when it is a real appearance object;
+     anything else is dropped so 关闭预设 cannot restore garbage. */
+  if (isObject(raw.presetUndo)) {
+    const undo = normalizeAppearance(raw.presetUndo, { withPresets: false });
+    undo.presets = [];
+    out.presetUndo = undo;
+  }
   out.activePreset = text(raw.activePreset).trim() ? text(raw.activePreset).trim().slice(0, 48) : out.activePreset;
   if (options.withPresets !== false) {
     const list = Array.isArray(raw.presets) ? raw.presets : [];
@@ -459,7 +469,7 @@ export function readAppearancePrefs(env = process.env) {
    page latched on window.__lunaAppearance and re-injects on a mismatch, which is what
    makes a watchdog restart after a code update take effect on a page that is already
    running an older runtime (the panel node alone cannot tell the two apart). */
-export const APPEARANCE_BUILD = "0.3.2+panel-dock.6";
+export const APPEARANCE_BUILD = "0.3.3+preset-off.2";
 const BUILD_TOKEN = "__LUNA_APPEARANCE_BUILD__";
 
 /* The page-side half. It is serialised with Function.prototype.toString() and evaluated
@@ -924,9 +934,16 @@ function pageRuntime() {
     ".face input[type=color]{width:100%;height:22px;padding:0;border:1px solid rgba(255,255,255,.18);border-radius:6px;background:transparent}",
     ".face select{width:100%;padding:5px 6px;border:1px solid rgba(255,255,255,.18);border-radius:8px;background:rgba(255,255,255,.06);color:#f4f7ff;font:500 12px/1.2 inherit}",
     ".presets{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:6px}",
+    ".presetRow{display:grid;grid-template-columns:1fr auto;gap:4px;align-items:stretch}",
+    ".presetRow .pbtn{width:100%}",
     ".pbtn{padding:9px 6px;border:1px solid rgba(255,255,255,.16);border-radius:9px;background:rgba(255,255,255,.06);color:#e6eefb;font:650 11.5px/1.3 inherit;cursor:pointer;text-align:center}",
     ".pbtn.active{background:rgba(56,189,248,.4);border-color:rgba(125,211,252,.75);color:#fff}",
     ".pbtn.confirm{background:rgba(248,113,113,.45);border-color:rgba(252,165,165,.8)}",
+    ".pbtn.remove{padding:0;font:700 13px/1 inherit;color:#fca5a5;background:rgba(248,113,113,.16);border-color:rgba(252,165,165,.4)}",
+    ".pbtn.remove:hover{background:rgba(248,113,113,.34)}",
+    ".clear-preset{grid-column:1 / -1;padding:9px 6px;border:1px solid rgba(252,165,165,.45);border-radius:9px;background:rgba(248,113,113,.22);color:#ffe4e4;font:650 11.5px/1.3 inherit;cursor:pointer}",
+    ".clear-preset:hover{background:rgba(248,113,113,.36)}",
+    ".clear-preset.idle{opacity:.4;cursor:default}",
     ".actions{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:8px}",
     ".actions button{padding:8px 4px;border:1px solid rgba(255,255,255,.16);border-radius:9px;background:rgba(56,189,248,.2);color:#f2f7ff;font:650 11px/1.2 inherit;cursor:pointer}",
     ".hint{font:500 11px/1.45 inherit;color:#8fa2bb;margin:2px 0 10px}",
@@ -1172,13 +1189,23 @@ function pageRuntime() {
 
   const renderPresets = body => lazySection(body, "预设", false, wrap => {
     const list = el("div", "presets");
+    /* Snapshot of the current look, minus the preset list. Kept local on purpose:
+       the page runtime is serialized with toString(), so a module-level helper like
+       appearanceSnapshot() would be a ReferenceError inside the page. */
+    const snapshotCurrent = () => {
+      const copy = JSON.parse(JSON.stringify(state));
+      copy.presets = [];
+      copy.presetUndo = null;
+      return normalize(copy, { withPresets: false });
+    };
     /* Two-step confirm instead of window.confirm(): a blocking dialog on an unfocused
        window would freeze the page the watchdog is driving. */
     const draw = () => {
       list.textContent = "";
       for (const preset of presetList()) {
+        const active = state.activePreset === preset.name;
         const button = el("button", "pbtn", preset.name + (preset.builtIn ? "" : " · 导入"));
-        button.classList.toggle("active", state.activePreset === preset.name);
+        button.classList.toggle("active", active);
         let armed = false;
         let disarmed = null;
         const restore = () => {
@@ -1189,6 +1216,21 @@ function pageRuntime() {
           button.textContent = preset.name + (preset.builtIn ? "" : " · 导入");
         };
         button.addEventListener("click", () => {
+          /* Clicking the preset that is already applied turns it back off and
+             restores the look from before it was applied. Without this the only
+             way out of a preset was to hand-edit every field. */
+          if (active) {
+            const undo = state.presetUndo;
+            if (!undo) { say("没有可还原的上一份配置：请手动调整，或套用其他预设", true); return; }
+            const kept = presetList().map(entry => ({ name: entry.name, builtIn: entry.builtIn, values: entry.values }));
+            const next = JSON.parse(JSON.stringify(undo));
+            next.presets = kept;
+            next.activePreset = "自定义";
+            next.presetUndo = null;
+            applyNormalized(next);
+            say("已关闭预设：" + preset.name + "，已还原套用前的配置");
+            return;
+          }
           if (!armed) {
             armed = true;
             button.classList.add("confirm");
@@ -1198,14 +1240,52 @@ function pageRuntime() {
           }
           if (disarmed) clearTimeout(disarmed);
           armed = false;
+          /* Remember what the user had before overwriting it. */
+          const previous = snapshotCurrent();
           const kept = presetList().map(entry => ({ name: entry.name, builtIn: entry.builtIn, values: entry.values }));
           const next = JSON.parse(JSON.stringify(preset.values));
           next.presets = kept;
           next.activePreset = preset.name;
+          next.presetUndo = previous;
           applyNormalized(next);
-          say("已套用预设：" + preset.name);
+          say("已套用预设：" + preset.name + "（再次点击该预设可关闭并还原）");
         });
         list.append(button);
+
+        /* Imported presets can be removed; factory ones only get hidden by
+           overriding, so they are never deletable. */
+        if (!preset.builtIn) {
+          const row = el("div", "presetRow");
+          button.replaceWith(row);
+          row.append(button);
+          const remove = el("button", "pbtn remove", "×");
+          remove.title = "删除这个导入的预设";
+          remove.addEventListener("click", event => {
+            event.stopPropagation();
+            const name = preset.name;
+            const entries = presetList().filter(entry => entry.name !== name);
+            state.presets = entries;
+            if (state.activePreset === name) {
+              const undo = state.presetUndo;
+              const kept = entries.map(entry => ({ name: entry.name, builtIn: entry.builtIn, values: entry.values }));
+              if (undo) {
+                const next = JSON.parse(JSON.stringify(undo));
+                next.presets = kept;
+                next.activePreset = "自定义";
+                next.presetUndo = null;
+                applyNormalized(next);
+              } else {
+                state.activePreset = "自定义";
+                applyNormalized(state);
+              }
+            } else {
+              draw();
+              debouncedSave();
+            }
+            say("已删除预设：" + name);
+          });
+          row.append(remove);
+        }
       }
     };
     draw();
@@ -1218,6 +1298,41 @@ function pageRuntime() {
     const saveButton = el("button", null, "存为预设");
     actions.append(exportButton, importButton, saveButton);
     wrap.append(actions);
+
+    /* A dedicated exit: the first thing a user looks for after applying a preset
+       is how to undo it, and hunting for "click the same button again" is not it. */
+    const closeRow = el("div", "actions");
+    const clearButton = el("button", "clear-preset", "关闭预设并还原");
+    closeRow.append(clearButton);
+    wrap.append(closeRow);
+    wrap.append(el("div", "hint", "再次点击已启用的预设、或点上面的「关闭预设并还原」，都会恢复套用前的外观。导入的预设可以点 × 删除。"));
+
+    const clearPreset = () => {
+      if (state.activePreset === "自定义" && !state.presetUndo) {
+        say("当前没有启用预设，无需关闭");
+        return false;
+      }
+      const undo = state.presetUndo;
+      if (!undo) {
+        say("没有可还原的上一份配置：请手动调整，或套用其他预设", true);
+        return false;
+      }
+      const kept = presetList().map(entry => ({ name: entry.name, builtIn: entry.builtIn, values: entry.values }));
+      const next = JSON.parse(JSON.stringify(undo));
+      next.presets = kept;
+      next.activePreset = "自定义";
+      next.presetUndo = null;
+      applyNormalized(next);
+      say("已关闭预设，已还原套用前的配置");
+      return true;
+    };
+    clearButton.addEventListener("click", clearPreset);
+    syncers.push(() => {
+      const hasUndo = !!state.presetUndo;
+      clearButton.disabled = !hasUndo;
+      clearButton.textContent = hasUndo ? "关闭预设并还原" : "关闭预设并还原（无记录）";
+      clearButton.classList.toggle("idle", !hasUndo);
+    });
     wrap.append(el("div", "hint", "导出会下载 JSON 并把内容填进下方文本框（便于手动复制）；导入只加入列表，不会自动套用，非法 JSON 只会报错、不动现有配置。"));
 
     const fileInput = el("input");
@@ -1678,6 +1793,7 @@ function pageRuntime() {
         mascot: { enabled: false, form: "whale", scale: 1, x: 96, y: 92, drag: true, file: "", image: "" }
       },
       ui: { dock: "br", left: null, top: null, width: 342, layout: "stack" },
+      presetUndo: null,
       presets: []
     };
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
@@ -1803,6 +1919,11 @@ function pageRuntime() {
     out.ui.left = Number.isFinite(left) ? Math.max(0, Math.min(10000, Math.round(left))) : null;
     out.ui.top = Number.isFinite(top) ? Math.max(0, Math.min(10000, Math.round(top))) : null;
     if (out.ui.dock === "free" && (out.ui.left === null || out.ui.top === null)) out.ui.dock = "br";
+    if (raw.presetUndo && typeof raw.presetUndo === "object" && !Array.isArray(raw.presetUndo)) {
+      const undo = normalize(raw.presetUndo, { withPresets: false });
+      undo.presets = [];
+      out.presetUndo = undo;
+    }
     if (withPresets) {
       const list = Array.isArray(raw.presets) ? raw.presets : [];
       for (const entry of list) {

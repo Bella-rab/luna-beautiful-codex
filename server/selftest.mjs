@@ -294,37 +294,61 @@ async function verifyTransitionSwitch(page) {
 }
 
 /* The appearance panel builds most sections lazily on first expand, so a check
-   that grabs a control before expanding the section sees nothing. The sections do
-   not exist at all while the panel is closed, so open it first. */
+   that grabs a control before expanding the section sees nothing. Opening the
+   panel re-mounts its body, so the section lookup is retried until the list of
+   <details> is stable instead of racing the re-render. */
 async function openAppearanceSection(page, title) {
-  return await page.evaluate(`(() => {
+  await page.evaluate(`(() => {
     const host = document.getElementById("codex-appearance-panel");
-    if (!host || !host.shadowRoot) return false;
-    const root = host.shadowRoot;
+    const root = host && host.shadowRoot;
+    if (!root) return false;
     const panel = root.getElementById("panel");
     if (panel && !panel.classList.contains("open")) root.getElementById("chip").click();
-    const details = [...root.querySelectorAll("details")].find(node => ((node.querySelector("summary") || {}).textContent || "").indexOf(${JSON.stringify(title)}) >= 0);
-    if (!details) return false;
-    if (!details.open) { details.open = true; details.dispatchEvent(new Event("toggle")); }
     return true;
   })()`);
+  const deadline = Date.now() + 6000;
+  while (Date.now() < deadline) {
+    const opened = await page.evaluate(`(() => {
+      const host = document.getElementById("codex-appearance-panel");
+      const root = host && host.shadowRoot;
+      if (!root) return false;
+      const details = [...root.querySelectorAll("details")].find(node => ((node.querySelector("summary") || {}).textContent || "").indexOf(${JSON.stringify(title)}) >= 0);
+      if (!details) return false;
+      if (!details.open) { details.open = true; details.dispatchEvent(new Event("toggle")); }
+      /* A section is usable only once its body has been built. */
+      const holder = details.querySelector(".sectionBody");
+      return !!(holder && holder.children.length);
+    })()`);
+    if (opened) return true;
+    await sleep(300);
+  }
+  return false;
 }
 
 /* Click a labelled .toggle row until it holds `want`. The label is the stable
-   prefix; the 开/关 suffix is what the syncers write. */
+   prefix; the 开/关 suffix is what the syncers write. The lookup is retried
+   because opening the panel rebuilds the section bodies. */
 async function setPanelToggle(page, label, want) {
-  return await page.evaluate(`(() => {
-    const host = document.getElementById("codex-appearance-panel");
-    const root = host && host.shadowRoot;
-    if (!root) return { ok: false, error: "appearance panel not injected" };
-    const button = [...root.querySelectorAll("button.toggle")].find(node => (node.textContent || "").trim().indexOf(${JSON.stringify(label)}) === 0);
-    if (!button) return { ok: false, error: "toggle not found: " + ${JSON.stringify(label)} };
-    const state = () => (button.textContent || "").trim().endsWith("开");
-    const before = state();
-    let clicks = 0;
-    while (state() !== ${want} && clicks < 4) { button.click(); clicks += 1; }
-    return { ok: state() === ${want}, label: ${JSON.stringify(label)}, before, after: state(), clicks };
-  })()`);
+  const deadline = Date.now() + 6000;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await page.evaluate(`(() => {
+      const host = document.getElementById("codex-appearance-panel");
+      const root = host && host.shadowRoot;
+      if (!root) return { ok: false, error: "appearance panel not injected" };
+      const button = [...root.querySelectorAll("button.toggle")].find(node => (node.textContent || "").trim().indexOf(${JSON.stringify(label)}) === 0);
+      if (!button) return { ok: false, error: "toggle not found: " + ${JSON.stringify(label)} };
+      const state = () => (button.textContent || "").trim().endsWith("开");
+      const before = state();
+      let clicks = 0;
+      while (state() !== ${want} && clicks < 4) { button.click(); clicks += 1; }
+      return { ok: state() === ${want}, label: ${JSON.stringify(label)}, before, after: state(), clicks };
+    })()`);
+    if (last && last.ok) return last;
+    if (last && last.error && !last.error.startsWith("toggle not found")) return last;
+    await sleep(300);
+  }
+  return last || { ok: false, error: "toggle lookup timed out" };
 }
 
 /* Phase 3: extension effects live in the page runtime and are observable
@@ -702,16 +726,26 @@ async function verifyPrefsMerge(page) {
    Dock cycling, the two-column layout and a real header drag are all asserted
    here, then the default placement is restored. */
 async function verifyPanelPlacement(page) {
-  const open = await page.evaluate(`(() => {
-    const root = document.getElementById("codex-appearance-panel")?.shadowRoot;
-    if (!root) return null;
+  /* Start from a known layout: a previous run (or the user) may have left the
+     panel dragged or in two-column mode, and the checks below compare widths. */
+  await page.evaluate(`(() => {
+    const host = document.getElementById("codex-appearance-panel");
+    const root = host && host.shadowRoot;
+    if (!root) return false;
     const panel = root.getElementById("panel");
-    const chip = root.getElementById("chip");
-    if (!panel.classList.contains("open")) chip.click();
+    if (!panel.classList.contains("open")) root.getElementById("chip").click();
     return true;
   })()`);
-  if (!open) return { ok: false, detail: "appearance panel not injected" };
   await sleep(500);
+  const resetOk = await page.evaluate(`(() => {
+    const root = document.getElementById("codex-appearance-panel").shadowRoot;
+    const button = root.getElementById("dock-tl");
+    if (!button) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!resetOk) return { ok: false, detail: "appearance panel not injected" };
+  await sleep(600);
 
   const state = () => page.evaluate(`(() => {
     const root = document.getElementById("codex-appearance-panel").shadowRoot;
@@ -775,6 +809,98 @@ async function verifyPanelPlacement(page) {
   return {
     ok,
     detail: `dock=${docked.ui.dock} wide=${wide.wide}/${wide.w}px cols=${wide.columns ? wide.columns.split(" ").length : "?"} drag=${dragged.free}@${dragged.ui.left},${dragged.ui.top} reset=${restored.ui.dock}/${restored.w}px reopened=${reopened.w}px`
+  };
+}
+
+/* Presets could only be applied - there was no way to turn one off again, so a
+   single misclick meant rebuilding the user's look by hand. Asserts apply ->
+   dedicated off button -> restored, and that an imported preset can be deleted. */
+async function verifyPresetOff(page) {
+  if (!(await openAppearanceSection(page, "预设"))) return { ok: false, detail: "预设 section not found" };
+  await sleep(300);
+
+  const snap = () => page.evaluate(`(() => {
+    const api = window.__lunaAppearance;
+    const state = api.state();
+    const root = document.getElementById("codex-appearance-panel").shadowRoot;
+    const clear = root.querySelector(".clear-preset");
+    return {
+      active: state.activePreset,
+      hasUndo: !!state.presetUndo,
+      blur: state.glass.blur,
+      glass: state.glass.enabled,
+      clearDisabled: clear ? clear.disabled : null,
+      names: (state.presets || []).map(entry => entry.name),
+      removeButtons: root.querySelectorAll(".presets .pbtn.remove").length
+    };
+  })()`);
+
+  const before = await snap();
+  /* The button list is rebuilt with the section body, so retry the click until it
+     lands instead of assuming one shot right after opening. */
+  let applied = false;
+  const applyDeadline = Date.now() + 6000;
+  while (Date.now() < applyDeadline && !applied) {
+    applied = await page.evaluate(`(() => {
+      const root = document.getElementById("codex-appearance-panel").shadowRoot;
+      const button = [...root.querySelectorAll(".presets .pbtn")].find(b => !b.classList.contains("remove") && b.textContent.trim().indexOf("黑客绿") === 0);
+      if (!button) return false;
+      button.click();
+      button.click();
+      return true;
+    })()`);
+    if (!applied) await sleep(300);
+  }
+  if (!applied) return { ok: false, detail: "黑客绿 preset button not found" };
+  await sleep(1200);
+  const afterApply = await snap();
+
+  const cleared = await page.evaluate(`(() => {
+    const root = document.getElementById("codex-appearance-panel").shadowRoot;
+    const button = root.querySelector(".clear-preset");
+    if (!button || button.disabled) return false;
+    button.click();
+    return true;
+  })()`);
+  await sleep(1200);
+  const afterClear = await snap();
+
+  /* Inject a throwaway preset and delete it, restoring the original list. */
+  const imported = await page.evaluate(`(() => {
+    const api = window.__lunaAppearance;
+    const state = JSON.parse(JSON.stringify(api.state()));
+    const base = JSON.parse(JSON.stringify(state));
+    base.presets = [];
+    base.activePreset = "__selftest_preset__";
+    state.presets = (state.presets || []).concat([{ name: "__selftest_preset__", builtIn: false, values: base }]);
+    api.apply(state);
+    const root = document.getElementById("codex-appearance-panel").shadowRoot;
+    const details = [...root.querySelectorAll("details")].find(n => ((n.querySelector("summary") || {}).textContent || "").indexOf("预设") >= 0);
+    if (details && !details.open) { details.open = true; details.dispatchEvent(new Event("toggle")); }
+    return true;
+  })()`);
+  await sleep(1000);
+  const withImported = await snap();
+  const deleted = await page.evaluate(`(() => {
+    const root = document.getElementById("codex-appearance-panel").shadowRoot;
+    const buttons = [...root.querySelectorAll(".presets .pbtn.remove")];
+    if (!buttons.length) return false;
+    buttons[buttons.length - 1].click();
+    return true;
+  })()`);
+  await sleep(1000);
+  const afterDelete = await snap();
+
+  const ok = applied
+    && afterApply.active === "黑客绿" && afterApply.hasUndo === true && afterApply.clearDisabled === false
+    && cleared
+    && afterClear.active === "自定义" && afterClear.hasUndo === false
+    && afterClear.blur === before.blur && afterClear.glass === before.glass
+    && imported && withImported.removeButtons >= 1
+    && deleted && !afterDelete.names.includes("__selftest_preset__");
+  return {
+    ok,
+    detail: `apply=${afterApply.active}/undo=${afterApply.hasUndo} off=${afterClear.active}/undo=${afterClear.hasUndo} blur ${before.blur}->${afterClear.blur} deleteTest=${withImported.removeButtons >= 1 && afterDelete.removeButtons === 0}`
   };
 }
 
@@ -860,7 +986,7 @@ async function main() {
     ["glass", await verifyGlassToggle(page)],
     ["transition", await verifyTransitionSwitch(page)],
     ["appearance-save", await verifyAppearanceSave(page)],
-    ["panel-placement", await verifyPanelPlacement(page)],
+    ["preset-off", await verifyPresetOff(page)],
     ["ext", await verifyExtEffects(page)],
   ];
   console.log("\nselftest: channels");
@@ -872,6 +998,9 @@ async function main() {
     ["white-text", await verifyWhiteText(page)],
     ["video-audio", await verifyVideoAudio(page, wallpapers, baselineLibrary)],
     ["reset", await verifyReset(page, original, wallpapers.find(item => item.id === original.source)?.renderMode || "native")],
+    /* Last on purpose: this one drags the panel around and changes its layout, so
+       running it earlier left later checks fighting a moved/rebuilt panel. */
+    ["panel-placement", await verifyPanelPlacement(page)],
   );
   for (const [id, outcome] of uiChecks) {
     rows.push({ id, mode: "ui", load: "-", detail: outcome.detail, seconds: 0, ok: outcome.ok });

@@ -2122,6 +2122,7 @@ log(`watchdog started pid=${process.pid}`);
 let lastWhite = null;
 let lastPickerOpen = false;
 let lastAppearanceRefresh = "";
+let lastAppearanceReason = "";
 /* Phase 2: rotation and the glass economy flag. rotationNextAt is epoch ms, so a
    config change simply rewrites it instead of restarting a timer object. */
 let rotationNextAt = 0;
@@ -2775,6 +2776,14 @@ for (;;) {
     const needsControls = state.page && !disabled && (!state.readability || !state.controls || controlsStale);
     const needsPicker = state.page && !state.picker;
     const needsAppearance = state.page && (!state.appearance || state.appearanceBuild !== APPEARANCE_BUILD);
+    if (needsAppearance && appearanceRunning) {
+      /* The injector exits 0 as soon as it has applied the state, so the next tick
+         can still see the old status. Log the reason once per distinct cause so a
+         re-injection storm is visible instead of silently rebuilding the panel
+         (which resets whatever the user had open). */
+      const reason = !state.appearance ? "panel-missing" : `build=${state.appearanceBuild} expected=${APPEARANCE_BUILD}`;
+      if (reason !== lastAppearanceReason) { lastAppearanceReason = reason; log(`appearance re-inject pending (${reason}); injector already running`); }
+    } else if (!needsAppearance) { lastAppearanceReason = ""; }
     if (!restoring && (needsBackground || (needsControls && !controlsRunning) || (needsPicker && !pickerRunning) || (needsAppearance && !appearanceRunning))) {
       restoring = true;
       const installSafety = setTimeout(() => { if (restoring) { log(`install forced-reset (over 180s): ${current.source}`); restoring = false; } }, 180000);
