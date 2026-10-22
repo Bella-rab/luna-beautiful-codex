@@ -22,6 +22,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import zlib from "node:zlib";
+import { spawn } from "node:child_process";
 import { buildWebDocument, webPropertyPayload } from "./web-wallpaper.mjs";
 
 const PORT = process.env.WATCHDOG_PORT || "43310";
@@ -904,6 +906,236 @@ async function verifyPresetOff(page) {
   };
 }
 
+/* ---------- full type coverage ----------
+   The user's own library usually contains only some of the kinds the plugin
+   supports (this machine had 9 WebGL scenes and 9 native videos, zero web, zero
+   static images, zero fallbacks). Those paths were therefore never exercised by a
+   real run. This fixture builds a throwaway Steam tree with one item per kind,
+   starts an isolated watchdog (own port + own state dir) against it, switches to
+   each item and asserts what the LIVE page actually built - then tears it down
+   without touching the user's library or the running watchdog. */
+function makePng(width, height, shade) {
+  const CRC_TABLE = (() => {
+    const table = new Int32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      table[n] = c;
+    }
+    return table;
+  })();
+  const crc32 = buffer => {
+    let c = 0xffffffff;
+    for (const byte of buffer) c = CRC_TABLE[(c ^ byte) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type, data) => {
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(data.length, 0);
+    const body = Buffer.concat([Buffer.from(type, "latin1"), data]);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(crc32(body), 0);
+    return Buffer.concat([length, body, crc]);
+  };
+  const raw = Buffer.alloc((width * 3 + 1) * height);
+  let offset = 0;
+  for (let y = 0; y < height; y++) {
+    raw[offset++] = 0;
+    for (let x = 0; x < width; x++) {
+      const [r, g, b] = shade(x / Math.max(1, width - 1), y / Math.max(1, height - 1));
+      raw[offset++] = r; raw[offset++] = g; raw[offset++] = b;
+    }
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", zlib.deflateSync(raw, { level: 9 })),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+function buildTypeFixtures(root) {
+  const workshop = path.join(root, "steamapps", "workshop", "content", "431960");
+  fs.mkdirSync(workshop, { recursive: true });
+  const gradient = (u, v) => [Math.round(30 + 150 * u), Math.round(40 + 90 * v), Math.round(200 - 120 * u)];
+
+  /* web: HTML entry with an external stylesheet, an external script, an inline
+     script and a binary image - every resource the srcdoc inliner must handle. */
+  const web = path.join(workshop, "990000001");
+  fs.mkdirSync(path.join(web, "assets"), { recursive: true });
+  fs.writeFileSync(path.join(web, "project.json"), JSON.stringify({
+    title: "Selftest Web", type: "web", file: "index.html",
+    general: { properties: {
+      schemecolor: { text: "主色", type: "color", value: "0.2 0.8 0.6" },
+      speed: { text: "速度", type: "slider", value: 50, min: 0, max: 100, step: 1 },
+      glow: { text: "发光", type: "bool", value: true }
+    } }
+  }, null, 2));
+  fs.writeFileSync(path.join(web, "index.html"), [
+    "<!doctype html><html><head><meta charset=\"utf-8\">",
+    "<link rel=\"stylesheet\" href=\"style.css\"></head><body>",
+    "<canvas id=\"c\" width=\"640\" height=\"360\"></canvas>",
+    "<img id=\"pic\" src=\"assets/pic.png\">",
+    "<script src=\"script.js\"></script>",
+    "<script>window.__inlineRan = (window.__inlineRan || 0) + 1;</script>",
+    "</body></html>"
+  ].join(""));
+  fs.writeFileSync(path.join(web, "style.css"), "body{margin:0;background:#05070c;overflow:hidden}\n#c{display:block;width:100vw;height:100vh}");
+  fs.writeFileSync(path.join(web, "script.js"), [
+    "window.__fixtureReady = true;",
+    "window.wallpaperPropertyListener = { applyUserProperties: function (props) {",
+    "  try { parent.postMessage({ __fixturePropKeys: Object.keys(props || {}) }, '*'); } catch (e) {}",
+    "} };",
+    "var ctx = document.getElementById('c').getContext('2d');",
+    "ctx.fillStyle = '#2a3f5f'; ctx.fillRect(0, 0, 640, 360);"
+  ].join("\n"));
+  fs.writeFileSync(path.join(web, "assets", "pic.png"), makePng(48, 48, gradient));
+  fs.writeFileSync(path.join(web, "preview.png"), makePng(160, 90, gradient));
+
+  /* native: a plain image file declared directly. */
+  const image = path.join(workshop, "990000002");
+  fs.mkdirSync(image, { recursive: true });
+  fs.writeFileSync(path.join(image, "project.json"), JSON.stringify({ title: "Selftest Image", type: "image", file: "wall.png" }, null, 2));
+  fs.writeFileSync(path.join(image, "wall.png"), makePng(320, 180, gradient));
+
+  /* fallback: declares scene.pkg but ships only a preview - a half-installed item. */
+  const fallback = path.join(workshop, "990000003");
+  fs.mkdirSync(fallback, { recursive: true });
+  fs.writeFileSync(path.join(fallback, "project.json"), JSON.stringify({ title: "Selftest Fallback", type: "scene", file: "scene.pkg" }, null, 2));
+  fs.writeFileSync(path.join(fallback, "preview.png"), makePng(240, 135, gradient));
+
+  /* empty: nothing usable, must never appear in the library. */
+  const empty = path.join(workshop, "990000004");
+  fs.mkdirSync(empty, { recursive: true });
+  fs.writeFileSync(path.join(empty, "project.json"), JSON.stringify({ title: "Selftest Empty" }, null, 2));
+
+  return { root, workshop };
+}
+
+async function verifyAllTypes(page, port) {
+  const root = path.join(os.tmpdir(), "luna-selftest-types");
+  const stateDir = path.join(os.tmpdir(), "luna-selftest-types-state");
+  const base = `http://127.0.0.1:${port}`;
+  try { fs.rmSync(root, { recursive: true, force: true }); } catch {}
+  try { fs.rmSync(stateDir, { recursive: true, force: true }); } catch {}
+  buildTypeFixtures(root);
+  fs.mkdirSync(stateDir, { recursive: true });
+
+  const child = spawn(process.execPath, [path.join(import.meta.dirname, "codex-wallpaper-watchdog.mjs")], {
+    env: {
+      ...process.env,
+      WATCHDOG_PORT: String(port),
+      LUNA_STATE_DIR: stateDir,
+      STEAM_LIBRARY: root,
+      /* Otherwise the registry probe adds the real Steam libraries and this run
+         would switch through the user's whole collection. */
+      STEAM_LIBRARY_ONLY: "1",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let log = "";
+  child.stdout.on("data", chunk => { log += chunk.toString(); });
+  child.stderr.on("data", chunk => { log += chunk.toString(); });
+
+  const waitHealth = async () => {
+    const deadline = Date.now() + 25000;
+    while (Date.now() < deadline) {
+      try {
+        const response = await fetch(`${base}/health`, { signal: AbortSignal.timeout(1200) });
+        if (response.ok) return true;
+      } catch {}
+      await sleep(400);
+    }
+    return false;
+  };
+  const waitBuilt = async (id, predicate, timeoutMs) => {
+    const deadline = Date.now() + timeoutMs;
+    let last = null;
+    while (Date.now() < deadline) {
+      await sleep(1200);
+      last = await page.evaluate(`(() => {
+        const media = document.getElementById("codex-custom-background-media");
+        const base = document.getElementById("codex-custom-background-base");
+        return {
+          source: media?.getAttribute("data-wallpaper-source") || base?.getAttribute("data-wallpaper-source") || null,
+          renderMode: media?.getAttribute("data-render-mode") || null,
+          tag: media?.tagName || null,
+          width: media?.naturalWidth || media?.videoWidth || 0,
+          height: media?.naturalHeight || media?.videoHeight || 0,
+          webReady: media?.getAttribute("data-web-ready") || null,
+          webScripts: media?.getAttribute("data-web-scripts") || null
+        };
+      })()`);
+      if (last && last.source === id && predicate(last)) return { ok: true, state: last };
+    }
+    return { ok: false, state: last };
+  };
+
+  try {
+    if (!(await waitHealth())) return { ok: false, detail: "fixture watchdog did not start: " + log.slice(-300) };
+
+    const listed = await json(`${base}/wallpapers`);
+    const byMode = {};
+    for (const item of listed) byMode[item.renderMode] = (byMode[item.renderMode] || 0) + 1;
+    const emptyLeaked = listed.some(item => item.id === "990000004");
+
+    await json(`${base}/select?id=990000001`);
+    const web = await waitBuilt("990000001", s => s.renderMode === "web" && s.tag === "IFRAME", 90000);
+
+    let bridge = { ok: false, detail: "no parent listener" };
+    if (web.ok) {
+      await page.evaluate(`(() => {
+        window.__typeMessages = [];
+        window.addEventListener("message", event => { try { window.__typeMessages.push(JSON.parse(JSON.stringify(event.data || {}))); } catch {} });
+        return true;
+      })()`);
+      await json(`${base}/select?id=990000001`);
+      await waitBuilt("990000001", s => s.renderMode === "web" && s.tag === "IFRAME", 90000);
+      await page.evaluate(`(() => {
+        const media = document.getElementById("codex-custom-background-media");
+        if (!media || !media.contentWindow) return false;
+        media.contentWindow.postMessage({ __lunaProps: { speed: { value: 77 } } }, "*");
+        return true;
+      })()`);
+      await sleep(1600);
+      const messages = JSON.parse(await page.evaluate(`JSON.stringify(window.__typeMessages || [])`) || "[]");
+      const booted = messages.some(m => typeof m.__lunaBooted === "string");
+      const keys = messages.filter(m => Array.isArray(m.__fixturePropKeys)).map(m => m.__fixturePropKeys);
+      const propsOk = keys.some(list => list.includes("speed"));
+      bridge = { ok: booted && propsOk, detail: `booted=${booted} propKeys=${keys.length}` };
+    }
+
+    await json(`${base}/select?id=990000002`);
+    const nativeImage = await waitBuilt("990000002", s => s.renderMode === "native" && s.tag === "IMG" && s.width > 0, 45000);
+
+    await json(`${base}/select?id=990000003`);
+    const fallback = await waitBuilt("990000003", s => s.tag === "IMG" && s.width > 0, 45000);
+
+    const ok = !emptyLeaked
+      && byMode.web === 1 && byMode.native === 1 && byMode.fallback === 1
+      && web.ok && web.state.webReady === "true" && Number(web.state.webScripts) > 0
+      && bridge.ok
+      && nativeImage.ok
+      && fallback.ok;
+    return {
+      ok,
+      detail: `modes=${JSON.stringify(byMode)} empty=${emptyLeaked ? "leaked" : "skipped"} `
+        + `web=${web.ok ? `iframe/${web.state.webScripts} scripts` : "FAIL"} `
+        + `bridge=${bridge.detail} native=${nativeImage.ok ? `${nativeImage.state.width}x${nativeImage.state.height}` : "FAIL"} `
+        + `fallback=${fallback.ok ? `${fallback.state.width}x${fallback.state.height}` : "FAIL"}`
+    };
+  } catch (error) {
+    return { ok: false, detail: `type coverage crashed: ${error.message}` };
+  } finally {
+    try { child.kill(); } catch {}
+    for (const cleanup of [root, stateDir]) { try { fs.rmSync(cleanup, { recursive: true, force: true }); } catch {} }
+  }
+}
+
 async function main() {
   let health;
   try { health = await json(`${BASE}/health`); } catch (error) { console.error(`selftest: watchdog unreachable on ${BASE} (${error.message})`); process.exit(1); }
@@ -1002,6 +1234,8 @@ async function main() {
        running it earlier left later checks fighting a moved/rebuilt panel. */
     ["panel-placement", await verifyPanelPlacement(page)],
   );
+  console.log("\nselftest: every render type (isolated fixture library)");
+  uiChecks.push(["all-types", await verifyAllTypes(page, 43999)]);
   for (const [id, outcome] of uiChecks) {
     rows.push({ id, mode: "ui", load: "-", detail: outcome.detail, seconds: 0, ok: outcome.ok });
     console.log(`  ${outcome.ok ? "OK" : "FAIL"}  ${id}: ${outcome.detail}`);

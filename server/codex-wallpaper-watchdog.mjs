@@ -9,14 +9,19 @@ import { TRANSITION_MS, filterWallpapers, libraryPayload, normalizeLibrary, tagO
 import { buildWebDocument, webPreludeSource, webPropertyPayload } from "./web-wallpaper.mjs";
 
 const root = import.meta.dirname;
-const stateRoot = path.join(process.env.APPDATA || os.homedir(), "Codex", "luna-beautiful-codex");
+/* Both the state directory and the port are overridable so a test instance can
+   run against a throwaway library without touching the user's selection/prefs. */
+const stateRoot = process.env.LUNA_STATE_DIR
+  || path.join(process.env.APPDATA || os.homedir(), "Codex", "luna-beautiful-codex");
 const selectionPath = path.join(stateRoot, "wallpaper-selection.json");
 const prefsPath = path.join(stateRoot, "prefs.json");
 const controlsScript = path.join(root, "inject-background-controls.mjs");
 const pickerScript = path.join(root, "inject-wallpaper-picker.mjs");
 const appearanceScript = path.join(root, "inject-appearance.mjs");
 const logPath = path.join(root, "codex-wallpaper-watchdog.log");
-const lockPort = 43310;
+/* Overridable so a test run can bring up a second watchdog against a throwaway
+   library without fighting the live instance for the lock port. */
+const lockPort = Number(process.env.WATCHDOG_PORT) || 43310;
 /* Must match inject-background-controls.mjs; a mismatch makes the watchdog
    re-inject the panel once so a code update reaches the live page. */
 const CONTROLS_BUILD = "0.3.2+panel-fixes.5";

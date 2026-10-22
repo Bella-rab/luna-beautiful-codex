@@ -148,6 +148,13 @@ export function steamLibraries() {
   if (cachedLibraries) return cachedLibraries;
   const libraries = new Set();
   if (process.env.STEAM_LIBRARY) libraries.add(process.env.STEAM_LIBRARY);
+  /* Tests point STEAM_LIBRARY at a throwaway tree; without this the registry and
+     drive probe still add the real Steam libraries, so a "fixture only" run ends
+     up listing the user's whole collection too. */
+  if (process.env.STEAM_LIBRARY_ONLY === "1") {
+    cachedLibraries = [...libraries];
+    return cachedLibraries;
+  }
 
   for (const [key, value] of [
     ["HKCU\\Software\\Valve\\Steam", "SteamPath"],
