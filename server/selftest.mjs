@@ -148,19 +148,40 @@ async function verifyPicker(page, restoreSource, restoreMode) {
 
   await clickPoint(page, launcher.x, launcher.y);
   await sleep(400);
-  const opened = await page.evaluate(`(() => {
+  /* Ask the watchdog to rescan, then wait for the panel to render the FRESH list.
+     A panel that still shows ids from a previous (now deleted) fixture library
+     made this check click a wallpaper that no longer exists, so the click could
+     never apply. */
+  await page.evaluate(`(() => {
     const host = document.getElementById("codex-wallpaper-picker");
-    const panel = host.shadowRoot.querySelector(".panel");
-    const rows = [...host.shadowRoot.querySelectorAll(".item")];
-    const selected = document.getElementById("codex-custom-background-media")?.getAttribute("data-wallpaper-source") || "";
-    const row = rows.find(item => item.querySelector(".id").textContent.trim() !== selected) || rows[0];
-    const rect = row ? row.getBoundingClientRect() : null;
-    return {
-      display: getComputedStyle(panel).display,
-      rows: rows.length,
-      pick: rect ? { id: row.querySelector(".id").textContent.trim(), x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 } : null
-    };
+    if (host) host.dataset.libraryRequest = String(Date.now());
+    return true;
   })()`);
+  const knownIds = new Set((await json(`${BASE}/wallpapers`)).map(item => item.id));
+  let opened = null;
+  for (let attempt = 0; attempt < 12; attempt++) {
+    await sleep(600);
+    opened = await page.evaluate(`(() => {
+      const host = document.getElementById("codex-wallpaper-picker");
+      const panel = host.shadowRoot.querySelector(".panel");
+      const rows = [...host.shadowRoot.querySelectorAll(".item")];
+      const selected = document.getElementById("codex-custom-background-media")?.getAttribute("data-wallpaper-source") || "";
+      const row = rows.find(item => item.querySelector(".id").textContent.trim() !== selected) || rows[0];
+      const rect = row ? row.getBoundingClientRect() : null;
+      return {
+        display: getComputedStyle(panel).display,
+        rows: rows.length,
+        ids: rows.map(item => item.querySelector(".id").textContent.trim()),
+        pick: rect ? { id: row.querySelector(".id").textContent.trim(), x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 } : null
+      };
+    })()`);
+    /* Every listed row must exist in the live library before we click one. */
+    if (opened && opened.pick && knownIds.has(opened.pick.id)) break;
+    opened = null;
+  }
+  if (!opened) {
+    return { ok: false, detail: `picker listed ids outside the live library: ${JSON.stringify((await json(`${BASE}/wallpapers`)).slice(0, 3).map(w => w.id))}` };
+  }
   /* Phase 2 turned the panel into a flex column; any visible display is fine. */
   if (opened.display === "none") return { ok: false, detail: `panel stayed hidden after clicking 壁纸 (computed display=${opened.display})` };
   if (!opened.pick) return { ok: false, detail: "panel opened but listed no wallpapers" };
@@ -1136,6 +1157,366 @@ async function verifyAllTypes(page, port) {
   }
 }
 
+/* Ask the page (Chromium) to encode real media samples. Nothing is faked: if the
+   browser cannot encode a format it silently returns PNG instead, so every result
+   carries the ACTUAL mime and callers can reject a mislabelled file. */
+async function encodeSamples(page) {
+  /* awaitPromise must be true: the body is an async IIFE, so without it this
+     returns the unresolved Promise (which serialises to an empty object and made
+     every sample look unavailable). */
+  return await page.evaluate(`(async () => {
+    const W = 200, H = 112;
+    const canvas = document.createElement("canvas");
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext("2d");
+    const paint = () => {
+      const g = ctx.createLinearGradient(0, 0, W, H);
+      g.addColorStop(0, "#16233d"); g.addColorStop(0.5, "#b8402c"); g.addColorStop(1, "#0a0e16");
+      ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    };
+    paint();
+    const toBase64 = async (type, quality) => {
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, type, quality));
+      if (!blob) return null;
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      let binary = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      return { mime: blob.type, requested: type, base64: btoa(binary), bytes: bytes.length };
+    };
+    const out = {};
+    out.png = await toBase64("image/png");
+    out.jpg = await toBase64("image/jpeg", 0.9);
+    out.webp = await toBase64("image/webp", 0.9);
+    /* A minimal valid GIF89a: 2x2, one frame. */
+    const gif = new Uint8Array([
+      0x47,0x49,0x46,0x38,0x39,0x61, 0x02,0x00,0x02,0x00, 0x80,0x00,0x00,
+      0xFF,0x00,0x00, 0x00,0x00,0xFF, 0x2C,0x00,0x00,0x00,0x00,0x02,0x00,0x02,0x00,0x00,
+      0x02,0x02,0x44,0x01,0x00, 0x3B
+    ]);
+    let gifBinary = "";
+    for (const byte of gif) gifBinary += String.fromCharCode(byte);
+    out.gif = { mime: "image/gif", requested: "image/gif", base64: btoa(gifBinary), bytes: gif.length };
+
+    const record = async (mime, framesMs) => {
+      if (typeof MediaRecorder === "undefined" || !MediaRecorder.isTypeSupported(mime)) return null;
+      const stream = canvas.captureStream(25);
+      try {
+        const recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 1500000 });
+        const chunks = [];
+        recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+        const stopped = new Promise(resolve => { recorder.onstop = resolve; });
+        recorder.start();
+        const started = performance.now();
+        const timer = setInterval(() => {
+          const t = (performance.now() - started) / 1000;
+          ctx.fillStyle = "hsl(" + ((t * 120) % 360) + ",65%,42%)";
+          ctx.fillRect(0, 0, W, H);
+        }, 40);
+        /* The muxer needs real frames: a 1.2s capture produced a 110-byte webm and
+           a 0-byte mp4, which then looked like "the browser cannot encode video".
+           2.2s reliably yields a playable file on this machine. */
+        await new Promise(r => setTimeout(r, framesMs));
+        clearInterval(timer);
+        recorder.stop();
+        await stopped;
+        const blob = new Blob(chunks, { type: mime.split(";")[0] });
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        if (bytes.length < 2000) return null;
+        let binary = "";
+        for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        return { mime: mime.split(";")[0], requested: mime, base64: btoa(binary), bytes: bytes.length };
+      } catch { return null; }
+      finally { for (const track of stream.getTracks()) { try { track.stop(); } catch {} } }
+    };
+    out.webm = await record("video/webm;codecs=vp9", 4000);
+    out.mp4 = await record("video/mp4;codecs=avc1.42E01E", 4000);
+
+    /* Bytes on disk are not proof of a playable file. Decode each video back into a
+       canvas and require non-black pixels; a truncated mux would otherwise sail
+       through as "the browser encoded it". */
+    const decodable = async payload => {
+      if (!payload || !payload.base64) return false;
+      try {
+        const binary = atob(payload.base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const url = URL.createObjectURL(new Blob([bytes], { type: payload.mime }));
+        const video = document.createElement("video");
+        video.muted = true; video.playsInline = true; video.src = url;
+        const ready = await new Promise(resolve => {
+          const done = value => { if (value === true || value === false) resolve(value); };
+          video.onloadeddata = () => done(true);
+          video.onerror = () => done(false);
+          setTimeout(() => done(false), 6000);
+          video.load();
+        });
+        if (!ready) { URL.revokeObjectURL(url); return false; }
+        await video.play().catch(() => {});
+        await new Promise(r => setTimeout(r, 400));
+        const probe = document.createElement("canvas");
+        probe.width = 32; probe.height = 18;
+        const pctx = probe.getContext("2d");
+        pctx.drawImage(video, 0, 0, 32, 18);
+        const { data } = pctx.getImageData(0, 0, 32, 18);
+        let nonBlack = 0;
+        for (let i = 0; i < data.length; i += 4) {
+          if (data[i] + data[i + 1] + data[i + 2] > 30) nonBlack += 1;
+        }
+        try { video.pause(); } catch {}
+        URL.revokeObjectURL(url);
+        return nonBlack > 40;
+      } catch { return false; }
+    };
+    for (const ext of ["webm", "mp4"]) {
+      if (!out[ext]) continue;
+      const ok = await decodable(out[ext]);
+      if (!ok) out[ext] = null;
+    }
+    return out;
+  })()`, true);
+}
+
+/* Extension matrix: every media extension the plugin accepts, plus the degraded
+   shapes a real workshop folder can have (broken package, missing entry, corrupt
+   metadata). Runs against an isolated watchdog on its own port so the user's
+   library and the live watchdog are untouched. */
+async function verifyExtensionMatrix(page, port) {
+  const samples = await encodeSamples(page);
+  /* Keep only payloads whose ACTUAL mime matches what we asked for. Chromium
+     answers a request it cannot fulfil with PNG, and using that as "the webp
+     sample" would silently test PNG twice. */
+  const usable = {};
+  for (const [ext, payload] of Object.entries(samples || {})) {
+    if (!payload || !payload.base64) continue;
+    /* Compare only the container type: a recorder answers `video/webm;codecs=vp9`
+       by reporting `video/webm`, and an exact string match rejected every video
+       sample. A true encoder failure still shows up as `image/png` here. */
+    const asked = String(payload.requested || "").split(";")[0].trim();
+    const got = String(payload.mime || "").split(";")[0].trim();
+    if (asked && got !== asked) continue;
+    usable[ext] = payload;
+  }
+  const sampleReport = Object.entries(samples || {})
+    .map(([ext, payload]) => `${ext}=${payload ? `${payload.bytes}b` : "none"}`)
+    .join(" ");
+  console.log(`    samples: ${sampleReport}`);
+  console.log(`    usable: ${Object.keys(usable).join(",") || "(none)"}`);
+
+  const root = path.join(os.tmpdir(), "luna-matrix-lib");
+  const stateDir = path.join(os.tmpdir(), "luna-matrix-state");
+  try { fs.rmSync(root, { recursive: true, force: true }); } catch {}
+  try { fs.rmSync(stateDir, { recursive: true, force: true }); } catch {}
+  const workshop = path.join(root, "steamapps", "workshop", "content", "431960");
+  fs.mkdirSync(workshop, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+
+  const cases = [];
+  let nextId = 992000001;
+  const addCase = (label, build, expect) => {
+    const id = String(nextId++);
+    const dir = path.join(workshop, id);
+    fs.mkdirSync(dir, { recursive: true });
+    const extra = build(dir) || {};
+    cases.push({ id, label, expect, ...extra });
+  };
+  const drop = (dir, ext, name) => {
+    const payload = usable[ext];
+    if (!payload) return null;
+    const dest = path.join(dir, name);
+    fs.writeFileSync(dest, Buffer.from(payload.base64, "base64"));
+    return dest;
+  };
+
+  /* Every extension that maps through MEDIA_TYPES, as a directly declared file. */
+  for (const ext of ["mp4", "webm", "gif", "jpg", "png", "webp"]) {
+    addCase(`native .${ext}`, dir => {
+      const file = drop(dir, ext, `wall.${ext}`);
+      if (!file) return { skipped: `browser cannot encode .${ext}` };
+      fs.writeFileSync(path.join(dir, "project.json"), JSON.stringify({
+        title: `Matrix ${ext}`,
+        type: ext === "mp4" || ext === "webm" ? "video" : "image",
+        file: path.basename(file)
+      }, null, 2));
+      return {};
+    }, { tag: ext === "mp4" || ext === "webm" ? "VIDEO" : "IMG", renderMode: "native" });
+  }
+  /* Container aliases: the plugin must route them even when we only have an mp4
+     payload to copy (the demuxer decides, not the extension). */
+  for (const [ext, source] of [["m4v", "mp4"], ["mov", "mp4"], ["jpeg", "jpg"]]) {
+    addCase(`native .${ext}`, dir => {
+      const file = drop(dir, source, `wall.${ext}`);
+      if (!file) return { skipped: `no .${source} payload to alias` };
+      fs.writeFileSync(path.join(dir, "project.json"), JSON.stringify({
+        title: `Matrix ${ext}`, type: ext === "m4v" || ext === "mov" ? "video" : "image", file: path.basename(file)
+      }, null, 2));
+      return {};
+    }, { tag: ext === "m4v" || ext === "mov" ? "VIDEO" : "IMG", renderMode: "native" });
+  }
+  addCase("native .avif", dir => {
+    const file = drop(dir, "avif", "wall.avif");
+    if (!file) return { skipped: "browser cannot encode real AVIF" };
+    fs.writeFileSync(path.join(dir, "project.json"), JSON.stringify({ title: "Matrix avif", type: "image", file: "wall.avif" }, null, 2));
+    return {};
+  }, { tag: "IMG", renderMode: "native" });
+
+  /* Degraded shapes. */
+  addCase("scene: pkg missing, preview only", dir => {
+    fs.writeFileSync(path.join(dir, "project.json"), JSON.stringify({ title: "Matrix scene preview", type: "scene", file: "scene.pkg" }, null, 2));
+    fs.writeFileSync(path.join(dir, "preview.png"), makePng(180, 100, (u, v) => [40 + 120 * u, 60 + 80 * v, 180 - 90 * u]));
+    return {};
+  }, { tag: "IMG", renderMode: "fallback" });
+
+  addCase("scene: corrupt pkg, preview only", dir => {
+    fs.writeFileSync(path.join(dir, "project.json"), JSON.stringify({ title: "Matrix corrupt pkg", type: "scene", file: "scene.pkg" }, null, 2));
+    fs.writeFileSync(path.join(dir, "scene.pkg"), Buffer.concat([Buffer.from("PKGV0001", "latin1"), Buffer.from([0xff, 0xff, 0xff, 0x7f])]));
+    fs.writeFileSync(path.join(dir, "preview.png"), makePng(160, 90, (u, v) => [70 + 90 * u, 30 + 60 * v, 140 - 60 * u]));
+    return {};
+  }, { tag: "IMG", renderMode: "fallback" });
+
+  addCase("web: full asset spread", dir => {
+    fs.mkdirSync(path.join(dir, "assets"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "project.json"), JSON.stringify({
+      title: "Matrix web", type: "web", file: "index.html",
+      general: { properties: {
+        schemecolor: { text: "主色", type: "color", value: "0.1 0.6 0.9" },
+        speed: { text: "速度", type: "slider", value: 40, min: 0, max: 100, step: 1 },
+        glow: { text: "发光", type: "bool", value: true }
+      } }
+    }, null, 2));
+    fs.writeFileSync(path.join(dir, "index.html"), [
+      "<!doctype html><html><head><meta charset=\"utf-8\">",
+      "<link rel=\"stylesheet\" href=\"style.css\"></head><body>",
+      "<canvas id=\"c\" width=\"400\" height=\"225\"></canvas>",
+      "<img id=\"pic\" src=\"assets/pic.png\">",
+      "<script src=\"script.js\"></script>",
+      "<script>window.__inlineRan = (window.__inlineRan || 0) + 1;</script>",
+      "</body></html>"
+    ].join(""));
+    fs.writeFileSync(path.join(dir, "style.css"), "body{margin:0;background:#05070c;overflow:hidden}#c{display:block;width:100vw;height:100vh}");
+    fs.writeFileSync(path.join(dir, "script.js"), [
+      "window.__matrixReady = true;",
+      "window.wallpaperPropertyListener = { applyUserProperties: function (p) {",
+      "  try { parent.postMessage({ __matrixPropKeys: Object.keys(p || {}) }, '*'); } catch (e) {}",
+      "} };",
+      "var ctx = document.getElementById('c').getContext('2d');",
+      "ctx.fillStyle = '#123'; ctx.fillRect(0, 0, 400, 225);"
+    ].join("\n"));
+    fs.writeFileSync(path.join(dir, "assets", "pic.png"), makePng(32, 32, (u, v) => [200 * u, 120 * v, 90]));
+    return {};
+  }, { tag: "IFRAME", renderMode: "web" });
+
+  addCase("web: entry missing, preview only", dir => {
+    fs.writeFileSync(path.join(dir, "project.json"), JSON.stringify({ title: "Matrix web missing", type: "web", file: "nope.html" }, null, 2));
+    fs.writeFileSync(path.join(dir, "preview.png"), makePng(140, 79, (u, v) => [90 + 60 * u, 40 + 90 * v, 120]));
+    return {};
+  }, { tag: "IMG", renderMode: "fallback" });
+
+  addCase("metadata corrupt, real image present", dir => {
+    fs.writeFileSync(path.join(dir, "project.json"), "not json at all");
+    const file = drop(dir, "png", "wall.png");
+    if (!file) return { skipped: "no png payload" };
+    return {};
+  }, { tag: "IMG", renderMode: "native" });
+
+  addCase("everything empty", dir => {
+    fs.writeFileSync(path.join(dir, "project.json"), "{}");
+    return { skipped: "correctly absent from the library" };
+  }, { absent: true });
+
+  /* Isolated watchdog. */
+  const child = spawn(process.execPath, [path.join(import.meta.dirname, "codex-wallpaper-watchdog.mjs")], {
+    env: { ...process.env, WATCHDOG_PORT: String(port), LUNA_STATE_DIR: stateDir, STEAM_LIBRARY: root, STEAM_LIBRARY_ONLY: "1" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let childLog = "";
+  child.stdout.on("data", chunk => { childLog += chunk.toString(); });
+  child.stderr.on("data", chunk => { childLog += chunk.toString(); });
+
+  const base = `http://127.0.0.1:${port}`;
+  const report = { ok: true, cases: [] };
+  try {
+    const deadline = Date.now() + 25000;
+    let up = false;
+    while (Date.now() < deadline) {
+      try { if ((await fetch(`${base}/health`, { signal: AbortSignal.timeout(1200) })).ok) { up = true; break; } } catch {}
+      await sleep(400);
+    }
+    if (!up) return { ok: false, detail: "matrix watchdog did not start: " + childLog.slice(-240) };
+
+    const listed = await json(`${base}/wallpapers`);
+    const listedIds = new Set(listed.map(item => item.id));
+
+    for (const item of cases) {
+      if (item.skipped) { report.cases.push({ label: item.label, status: "skip", detail: item.skipped }); continue; }
+      if (item.expect.absent) {
+        const leaked = listedIds.has(item.id);
+        if (leaked) report.ok = false;
+        report.cases.push({ label: item.label, status: leaked ? "fail" : "pass", detail: leaked ? "listed but should not be" : "absent as expected" });
+        continue;
+      }
+      const entry = listed.find(row => row.id === item.id);
+      if (!entry) {
+        report.ok = false;
+        report.cases.push({ label: item.label, status: "fail", detail: "not listed by the scanner" });
+        continue;
+      }
+      if (entry.renderMode !== item.expect.renderMode) {
+        report.ok = false;
+        report.cases.push({ label: item.label, status: "fail", detail: `listed as ${entry.renderMode}, expected ${item.expect.renderMode}` });
+        continue;
+      }
+      await fetch(`${base}/select?id=${item.id}`);
+      const built = await (async () => {
+        const until = Date.now() + 45000;
+        let last = null;
+        while (Date.now() < until) {
+          await sleep(1100);
+          last = await page.evaluate(`(() => {
+            const media = document.getElementById("codex-custom-background-media");
+            const base = document.getElementById("codex-custom-background-base");
+            return {
+              source: media?.getAttribute("data-wallpaper-source") || base?.getAttribute("data-wallpaper-source") || null,
+              tag: media?.tagName || null,
+              width: media?.naturalWidth || media?.videoWidth || 0,
+              height: media?.naturalHeight || media?.videoHeight || 0,
+              readyState: media?.readyState ?? null,
+              webReady: media?.getAttribute("data-web-ready") || null
+            };
+          })()`);
+          if (!last || last.source !== item.id) continue;
+          if (item.expect.tag === "IFRAME") { if (last.tag === "IFRAME" && last.webReady === "true") return last; }
+          else if (last.tag === item.expect.tag && last.width > 0) return last;
+        }
+        return null;
+      })();
+      if (!built) {
+        report.ok = false;
+        report.cases.push({ label: item.label, status: "fail", detail: `no ${item.expect.tag} produced within 45s` });
+      } else {
+        report.cases.push({ label: item.label, status: "pass", detail: built.tag === "IFRAME" ? "iframe ready" : `${built.width}x${built.height}` });
+      }
+    }
+  } catch (error) {
+    report.ok = false;
+    report.cases.push({ label: "matrix harness", status: "fail", detail: error.message });
+  } finally {
+    try { child.kill(); } catch {}
+    for (const dir of [root, stateDir]) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} }
+  }
+
+  const pass = report.cases.filter(c => c.status === "pass").length;
+  const fail = report.cases.filter(c => c.status === "fail").length;
+  const skip = report.cases.filter(c => c.status === "skip").length;
+  const failedLabels = report.cases.filter(c => c.status === "fail").map(c => c.label).join(", ");
+  const skippedLabels = report.cases.filter(c => c.status === "skip").map(c => c.label).join(", ");
+  return {
+    ok: report.ok && fail === 0,
+    detail: `${pass} pass / ${fail} fail / ${skip} skip`
+      + (fail ? ` -> failed: ${failedLabels}` : "")
+      + (skip ? ` -> skipped: ${skippedLabels}` : "")
+  };
+}
+
 async function main() {
   let health;
   try { health = await json(`${BASE}/health`); } catch (error) { console.error(`selftest: watchdog unreachable on ${BASE} (${error.message})`); process.exit(1); }
@@ -1236,6 +1617,8 @@ async function main() {
   );
   console.log("\nselftest: every render type (isolated fixture library)");
   uiChecks.push(["all-types", await verifyAllTypes(page, 43999)]);
+  console.log("\nselftest: media extension matrix (isolated fixture library)");
+  uiChecks.push(["extensions", await verifyExtensionMatrix(page, 43998)]);
   for (const [id, outcome] of uiChecks) {
     rows.push({ id, mode: "ui", load: "-", detail: outcome.detail, seconds: 0, ok: outcome.ok });
     console.log(`  ${outcome.ok ? "OK" : "FAIL"}  ${id}: ${outcome.detail}`);

@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync, mkdirSync, openSync, readSync, closeSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -115,6 +115,39 @@ export function invalidateWallpaperCache() {
      it here made every picker open re-read every package (18 scenes, ~500MB) to
      look for an embedded video, which stalled the first pick by ~2 seconds. */
   if (sceneVideoMemo.size > 96) sceneVideoMemo.clear();
+}
+
+/* A scene.pkg whose header cannot be read is not a usable scene. Only the header
+   is inspected (magic + entry count), so this stays cheap: the real package is
+   read by the page later anyway. Memoized on (path, mtime, size) like the video
+   probe, so a re-downloaded package re-evaluates itself. */
+const sceneUsableMemo = new Map();
+function scenePackageUsable(scenePath) {
+  let stat;
+  try { stat = statSync(scenePath); } catch { return false; }
+  if (stat.size < 8) return false;
+  const memo = sceneUsableMemo.get(scenePath);
+  if (memo && memo.mtimeMs === stat.mtimeMs && memo.size === stat.size) return memo.ok;
+  let ok = false;
+  let handle = null;
+  try {
+    handle = openSync(scenePath, "r");
+    const head = Buffer.alloc(Math.min(64 * 1024, stat.size));
+    const read = readSync(handle, head, 0, head.length, 0);
+    if (read >= 8) {
+      /* Layout: int32 length, then "PKGV...." magic, then int32 entry count. */
+      const magicLength = head.readInt32LE(0);
+      if (magicLength > 0 && magicLength <= 32 && 4 + magicLength + 4 <= read) {
+        const magic = head.subarray(4, 4 + magicLength).toString("latin1");
+        const count = head.readInt32LE(4 + magicLength);
+        ok = magic.startsWith("PKGV") && count >= 0 && count < 200000;
+      }
+    }
+  } catch { ok = false; }
+  finally { if (handle !== null) { try { closeSync(handle); } catch {} } }
+  sceneUsableMemo.set(scenePath, { mtimeMs: stat.mtimeMs, size: stat.size, ok });
+  if (sceneUsableMemo.size > 256) sceneUsableMemo.delete(sceneUsableMemo.keys().next().value);
+  return ok;
 }
 
 function reg(key, value) {
@@ -235,6 +268,7 @@ export function listWallpapers() {
         let metadata = {};
         try { metadata = JSON.parse(readFileSync(path.join(directory, "project.json"), "utf8")); } catch {}
         let preview = null;
+        let sceneBroken = null;
         for (const name of ["preview.gif", "preview.jpg", "preview.png", "preview.jpeg", "preview.webp"]) {
           const candidate = path.join(directory, name);
           if (existsSync(candidate)) { preview = candidate; break; }
@@ -261,22 +295,61 @@ export function listWallpapers() {
             if (existsSync(sceneCandidate)) scene = sceneCandidate;
           }
         }
+        /* A broken or missing project.json used to hide a perfectly playable
+           folder: the scan only looked at metadata.file, so a directory holding a
+           real video/image next to an unparsable project.json was skipped entirely.
+           Fall back to the obvious media file in the folder itself. */
+        let loose = null;
+        if (!direct && !webEntry && !scene) {
+          try {
+            for (const name of readdirSync(directory)) {
+              const ext = path.extname(name).toLowerCase();
+              if (!MEDIA_TYPES.has(ext)) continue;
+              /* preview.* is the wallpaper's thumbnail, not a wallpaper in its own
+                 right. Treating it as a directly playable file turned every
+                 preview-only item into a "native" wallpaper and hid the fallback
+                 path it actually takes. */
+              if (/^preview\.(gif|jpe?g|png|webp)$/i.test(name)) continue;
+              const candidate = path.join(directory, name);
+              try { if (!statSync(candidate).isFile()) continue; } catch { continue; }
+              /* Prefer a video over a still: the playable one is what the user wants. */
+              if (!loose || MEDIA_TYPES.get(ext).startsWith("video/")) loose = candidate;
+              if (MEDIA_TYPES.get(ext).startsWith("video/")) break;
+            }
+          } catch {}
+        }
 
         let sceneVideo = null;
         if (scene) { try { sceneVideo = extractSceneVideo(scene); } catch {} }
 
-        if (!direct && !scene && !webEntry && !preview) continue;
+        /* A scene.pkg that cannot even be opened is not a WebGL scene, whatever
+           its name. Listing it as webgl made every selection pay a full failed
+           mount (often 10s+) before falling back to the preview. Probe it once
+           here - the result is memoized by (path, mtime, size) - and demote to the
+           preview path when the package is unusable. */
+        if (scene) {
+          const usable = scenePackageUsable(scene);
+          if (!usable) {
+            sceneBroken = scene;
+            scene = null;
+          }
+        }
+
+        const picked = direct || webEntry || scene || loose || preview;
+        if (!picked) continue;
         wallpapers.push({
           id, title: metadata.title || id,
           type: metadata.type || (direct ? "video" : scene ? "scene" : webEntry ? "web" : "unknown"),
-          file: direct || webEntry || sceneVideo || scene || preview,
-          preview, scene, direct, sceneVideo,
+          file: direct || webEntry || sceneVideo || scene || loose || preview,
+          preview, scene, direct: direct || loose, sceneVideo,
           webEntry, webDir,
           sceneDir: scene ? path.dirname(scene) : null,
+          brokenScene: sceneBroken,
           fallbackPreview: (!direct && !webEntry && !sceneVideo && preview) ? preview : null,
-          renderMode: direct ? "native" : scene ? "webgl" : webEntry ? "web" : preview ? "fallback" : "unknown",
+          renderMode: direct || loose ? "native" : scene ? "webgl" : webEntry ? "web" : preview ? "fallback" : "unknown",
           /* "scene" means the wallpaper is a WebGL scene (even when this switch
-             falls back to its preview), which is what the type filter offers. */
+             falls back to its preview), which is what the type filter offers.
+             A broken package is not offered as a scene: it can never render one. */
           kind: scene ? "scene" : webEntry ? "web" : direct && MEDIA_TYPES.get(declaredExt).startsWith("video/") ? "video" : "image",
           properties: parseWallpaperProperties(metadata),
           custom: false,
