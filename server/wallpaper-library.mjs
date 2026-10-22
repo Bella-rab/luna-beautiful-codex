@@ -236,6 +236,9 @@ function resolveCacheDir() {
    through the watchdog (it can never read a path itself), and the copy keeps its
    extension with a timestamp prefix so two uploads of "wall.jpg" cannot collide. */
 export function uploadsDir() {
+  /* Overridable so a test instance can exercise the custom-upload path without
+     writing into the user's real uploads folder. */
+  if (process.env.LUNA_UPLOADS_DIR) return process.env.LUNA_UPLOADS_DIR;
   const base = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
   return path.join(base, "Codex", "luna-beautiful-codex", "uploads");
 }

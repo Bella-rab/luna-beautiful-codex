@@ -94,11 +94,25 @@ export function buildWebDocument(item) {
     return url ? "url(\"" + url + "\")" : "url(\"" + TRANSPARENT_GIF + "\")";
   });
 
-  /* Stylesheet links become inline <style> blocks. Remote sheets cannot load
-     under frame-src/script-src anyway. */
+  /* Stylesheet links become inline <style> blocks. Any OTHER local link (favicon,
+     preload, manifest, ...) is inlined as a data URL: the frame is a srcdoc with an
+     opaque origin, so a relative href resolves against nothing and always 404s. A
+     missing favicon is harmless visually but it logged a network error on every
+     mount, and a preload that never resolves can hold the entry looking pending. */
   html = html.replace(/<link\b([^>]*)>/gi, (all, attrs) => {
-    if (!/\brel\s*=\s*(?:\"|')?stylesheet/i.test(attrs)) return all;
     const href = attrOf(attrs, "href");
+    if (!/\brel\s*=\s*(?:\"|')?stylesheet/i.test(attrs)) {
+      if (!href) return all;
+      const file = resolveLocal(dir, href);
+      if (!file) {
+        /* Remote/unresolvable references stay as they are; CSP blocks them anyway. */
+        if (!/^(?:data:|blob:|#)/i.test(href)) warnings.push("link resource not inlinable: " + href);
+        return all;
+      }
+      const url = dataUrlOf(file, href);
+      if (!url) return all;
+      return all.replace(/\bhref\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)/i, "href=\"" + url + "\"");
+    }
     const file = resolveLocal(dir, href);
     if (!file) { warnings.push("stylesheet skipped (not local): " + (href || "(empty)")); return ""; }
     let css = "";

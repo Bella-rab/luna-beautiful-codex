@@ -23,7 +23,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { buildWebDocument, webPropertyPayload } from "./web-wallpaper.mjs";
 
 const PORT = process.env.WATCHDOG_PORT || "43310";
@@ -1280,6 +1280,42 @@ async function encodeSamples(page) {
    shapes a real workshop folder can have (broken package, missing entry, corrupt
    metadata). Runs against an isolated watchdog on its own port so the user's
    library and the live watchdog are untouched. */
+/* AVIF cannot be encoded by Chromium's canvas (it silently answers PNG), but the
+   browser decodes it fine - so the sample is produced by Pillow when Python is
+   available, and the case is only skipped when no encoder exists at all. */
+function encodeAvifSample(dir, fileName = "wall.avif") {
+  const script = path.join(dir, "make_avif.py");
+  const outFile = path.join(dir, fileName);
+  fs.writeFileSync(script, [
+    "from PIL import Image",
+    "import sys",
+    "w, h = 320, 180",
+    "img = Image.new('RGB', (w, h))",
+    "px = img.load()",
+    "for y in range(h):",
+    "    for x in range(w):",
+    "        u = x / (w - 1); v = y / (h - 1)",
+    "        px[x, y] = (int(24 + 160 * u), int(30 + 110 * v), int(210 - 130 * u))",
+    "img.save(sys.argv[1], format='AVIF', quality=80)",
+  ].join("\n"));
+  const candidates = [
+    process.env.LUNA_PYTHON,
+    "D:/Python/python.exe",
+    "python",
+    "python3",
+  ].filter(Boolean);
+  for (const python of candidates) {
+    try {
+      const result = spawnSync(python, [script, outFile], { encoding: "utf8", timeout: 60000 });
+      if (result.status === 0 && fs.existsSync(outFile) && fs.statSync(outFile).size > 200) {
+        const head = fs.readFileSync(outFile).subarray(0, 24);
+        if (head.includes(Buffer.from("ftyp")) && head.includes(Buffer.from("avif"))) return outFile;
+      }
+    } catch {}
+  }
+  return null;
+}
+
 async function verifyExtensionMatrix(page, port) {
   const samples = await encodeSamples(page);
   /* Keep only payloads whose ACTUAL mime matches what we asked for. Chromium
@@ -1353,8 +1389,8 @@ async function verifyExtensionMatrix(page, port) {
     }, { tag: ext === "m4v" || ext === "mov" ? "VIDEO" : "IMG", renderMode: "native" });
   }
   addCase("native .avif", dir => {
-    const file = drop(dir, "avif", "wall.avif");
-    if (!file) return { skipped: "browser cannot encode real AVIF" };
+    const file = encodeAvifSample(dir);
+    if (!file) return { skipped: "no AVIF encoder (Chromium canvas cannot, Pillow not found)" };
     fs.writeFileSync(path.join(dir, "project.json"), JSON.stringify({ title: "Matrix avif", type: "image", file: "wall.avif" }, null, 2));
     return {};
   }, { tag: "IMG", renderMode: "native" });
@@ -1423,9 +1459,52 @@ async function verifyExtensionMatrix(page, port) {
     return { skipped: "correctly absent from the library" };
   }, { absent: true });
 
+  /* Custom uploads live in uploads/, not in the workshop, and are the one kind the
+     user adds by hand. They are scanned separately, so they need their own case. */
+  const uploadsDir = path.join(root, "uploads");
+  fs.mkdirSync(uploadsDir, { recursive: true });
+  const uploadedImage = usable.png || usable.jpg;
+  if (uploadedImage) {
+    const ext = uploadedImage === usable.png ? "png" : "jpg";
+    fs.writeFileSync(path.join(uploadsDir, `1770000000000_selftest upload.${ext}`), Buffer.from(uploadedImage.base64, "base64"));
+    cases.push({
+      id: "up_1770000000000_selftest upload",
+      label: "custom upload (image)",
+      expect: { tag: "IMG", renderMode: "native" },
+      upload: true
+    });
+  }
+  if (usable.mp4 || usable.webm) {
+    const video = usable.mp4 || usable.webm;
+    const ext = usable.mp4 ? "mp4" : "webm";
+    fs.writeFileSync(path.join(uploadsDir, `1770000000001_selftest clip.${ext}`), Buffer.from(video.base64, "base64"));
+    cases.push({
+      id: "up_1770000000001_selftest clip",
+      label: "custom upload (video)",
+      expect: { tag: "VIDEO", renderMode: "native" },
+      upload: true
+    });
+  }
+  /* Appearance images live in the same folder and must NOT be listed as wallpapers. */
+  if (uploadedImage) {
+    fs.writeFileSync(path.join(uploadsDir, `avatar_selftest.png`), Buffer.from(uploadedImage.base64, "base64"));
+    cases.push({
+      id: "up_avatar_selftest",
+      label: "avatar image must not be a wallpaper",
+      expect: { absent: true }
+    });
+  }
+
   /* Isolated watchdog. */
   const child = spawn(process.execPath, [path.join(import.meta.dirname, "codex-wallpaper-watchdog.mjs")], {
-    env: { ...process.env, WATCHDOG_PORT: String(port), LUNA_STATE_DIR: stateDir, STEAM_LIBRARY: root, STEAM_LIBRARY_ONLY: "1" },
+    env: {
+      ...process.env,
+      WATCHDOG_PORT: String(port),
+      LUNA_STATE_DIR: stateDir,
+      STEAM_LIBRARY: root,
+      STEAM_LIBRARY_ONLY: "1",
+      LUNA_UPLOADS_DIR: path.join(root, "uploads"),
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let childLog = "";
@@ -1514,6 +1593,173 @@ async function verifyExtensionMatrix(page, port) {
     detail: `${pass} pass / ${fail} fail / ${skip} skip`
       + (fail ? ` -> failed: ${failedLabels}` : "")
       + (skip ? ` -> skipped: ${skippedLabels}` : "")
+  };
+}
+
+/* Every web-resource type the inliner claims to support, in one document: rasters
+   (png/jpg/jpeg/webp/avif/gif/ico/svg), fonts (ttf/otf/woff/woff2), audio (wav),
+   video (mp4/webm), plus external and inline scripts and a stylesheet. Asserts each
+   one is actually embedded, and that no relative reference survives into the srcdoc
+   (the frame has an opaque origin, so any relative URL is a guaranteed 404). */
+function buildWebAssetFixture(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+  const write = (name, data) => fs.writeFileSync(path.join(dir, name), data);
+  write("index.html", [
+    "<!doctype html><html><head><meta charset=\"utf-8\">",
+    "<link rel=\"stylesheet\" href=\"style.css\">",
+    "<link rel=\"icon\" href=\"asset.ico\">",
+    "</head><body>",
+    "<canvas id=\"c\" width=\"200\" height=\"120\"></canvas>",
+    "<img src=\"asset.png\"><img src=\"asset.jpg\"><img src=\"asset.jpeg\">",
+    "<img src=\"asset.webp\"><img src=\"asset.avif\"><img src=\"asset.gif\">",
+    "<img src=\"icon.svg\">",
+    "<audio src=\"asset.wav\"></audio>",
+    "<video src=\"asset.mp4\" muted playsinline></video>",
+    "<video src=\"asset.webm\" muted playsinline></video>",
+    "<script src=\"app.js\"></script>",
+    "<script>window.__inlineRan = 1;</script>",
+    "</body></html>"
+  ].join(""));
+  write("style.css", [
+    "@font-face{font-family:F1;src:url(asset.ttf)}",
+    "@font-face{font-family:F2;src:url(asset.otf)}",
+    "@font-face{font-family:F3;src:url(asset.woff)}",
+    "@font-face{font-family:F4;src:url(asset.woff2)}",
+    "body{margin:0;background:#04070d url(asset.png);font-family:F1,F2,F3,F4}",
+    "#c{display:block;width:100vw;height:100vh}"
+  ].join("\n"));
+  write("app.js", "window.__fixtureReady = true;\n");
+  write("icon.svg", "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><circle cx=\"8\" cy=\"8\" r=\"7\" fill=\"#7dd3fc\"/></svg>");
+
+  const gradient = (u, v) => [Math.round(30 + 150 * u), Math.round(40 + 100 * v), Math.round(200 - 120 * u)];
+  for (const name of ["asset.png", "asset.jpg", "asset.jpeg", "asset.webp", "asset.gif"]) {
+    write(name, makePng(64, 36, gradient));
+  }
+  /* A real ICO is a container; reuse the PNG bytes under an .ico name only if the
+     system font/asset copy is unavailable is NOT acceptable, so build a minimal
+     valid ICO wrapping a PNG (the PNG-in-ICO form every browser accepts). */
+  const inner = makePng(32, 32, gradient);
+  const icoHeader = Buffer.alloc(22);
+  icoHeader.writeUInt16LE(0, 0);
+  icoHeader.writeUInt16LE(1, 2);
+  icoHeader.writeUInt16LE(1, 4);
+  icoHeader.writeUInt8(32, 6);
+  icoHeader.writeUInt8(32, 7);
+  icoHeader.writeUInt8(0, 8);
+  icoHeader.writeUInt8(0, 9);
+  icoHeader.writeUInt16LE(1, 10);
+  icoHeader.writeUInt16LE(32, 12);
+  icoHeader.writeUInt32LE(inner.length, 14);
+  icoHeader.writeUInt32LE(22, 18);
+  write("asset.ico", Buffer.concat([icoHeader, inner]));
+
+  return true;
+}
+
+async function verifyWebAssets(page) {
+  const dir = path.join(os.tmpdir(), "luna-web-assets-selftest");
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  buildWebAssetFixture(dir);
+
+  /* Real font binaries: copy from the system font folder, still validated by the
+     inliner as opaque bytes. */
+  const fontSources = {
+    "asset.ttf": ["arial.ttf", "segoeui.ttf", "consola.ttf", "tahoma.ttf"],
+    "asset.otf": ["Noto Sans SC (TrueType).otf"],
+    "asset.woff": ["seguisym.ttf", "segmdl2.ttf"],
+    "asset.woff2": ["segoeui.ttf"],
+  };
+  const fontsMissing = [];
+  for (const [name, candidates] of Object.entries(fontSources)) {
+    let copied = false;
+    for (const candidate of candidates) {
+      const source = path.join("C:\\Windows\\Fonts", candidate);
+      if (!fs.existsSync(source)) continue;
+      try { fs.copyFileSync(source, path.join(dir, name)); copied = true; break; } catch {}
+    }
+    if (!copied) fontsMissing.push(name);
+  }
+
+  /* Media the inliner must embed: generated from the page itself where Chromium
+     can encode. */
+  const samples = await encodeSamples(page);
+  const usableSamples = {};
+  for (const [ext, payload] of Object.entries(samples || {})) {
+    if (!payload || !payload.base64) continue;
+    const asked = String(payload.requested || "").split(";")[0].trim();
+    const got = String(payload.mime || "").split(";")[0].trim();
+    if (asked && got !== asked) continue;
+    usableSamples[ext] = payload;
+  }
+  for (const ext of ["mp4", "webm"]) {
+    const payload = usableSamples[ext];
+    if (!payload) continue;
+    fs.writeFileSync(path.join(dir, `asset.${ext}`), Buffer.from(payload.base64, "base64"));
+  }
+  /* WAV by hand; AVIF via Pillow (Chromium cannot encode it). */
+  {
+    const rate = 8000;
+    const frames = 2400;
+    const data = Buffer.alloc(frames * 2);
+    for (let i = 0; i < frames; i++) data.writeInt16LE(Math.floor(i / 30) % 2 ? 7000 : -7000, i * 2);
+    const header = Buffer.alloc(44);
+    header.write("RIFF", 0);
+    header.writeUInt32LE(36 + data.length, 4);
+    header.write("WAVE", 8);
+    header.write("fmt ", 12);
+    header.writeUInt32LE(16, 16);
+    header.writeUInt16LE(1, 20);
+    header.writeUInt16LE(1, 22);
+    header.writeUInt32LE(rate, 24);
+    header.writeUInt32LE(rate * 2, 28);
+    header.writeUInt16LE(2, 32);
+    header.writeUInt16LE(16, 34);
+    header.write("data", 36);
+    header.writeUInt32LE(data.length, 40);
+    fs.writeFileSync(path.join(dir, "asset.wav"), Buffer.concat([header, data]));
+  }
+  const avif = encodeAvifSample(dir, "asset.avif");
+  if (!avif) {
+    /* Without an AVIF encoder the reference must be removed, or the inliner will
+       warn about a missing file and the assertion below would be meaningless. */
+    const html = fs.readFileSync(path.join(dir, "index.html"), "utf8").replace("<img src=\"asset.avif\">", "");
+    fs.writeFileSync(path.join(dir, "index.html"), html);
+  }
+
+  const doc = buildWebDocument({ webEntry: path.join(dir, "index.html"), webDir: dir });
+  if (!doc.ok) return { ok: false, detail: `srcdoc build failed: ${doc.error}` };
+
+  const embedded = new Set(doc.resources.map(item => item.file));
+  const expected = ["asset.png", "asset.jpg", "asset.jpeg", "asset.webp", "asset.gif", "asset.ico", "icon.svg", "asset.wav"];
+  if (avif) expected.push("asset.avif");
+  if (usableSamples.mp4) expected.push("asset.mp4");
+  if (usableSamples.webm) expected.push("asset.webm");
+  for (const name of Object.keys(fontSources)) if (!fontsMissing.includes(name)) expected.push(name);
+
+  const missing = expected.filter(name => !embedded.has(name));
+  /* No relative media reference may survive: the frame cannot resolve one. */
+  const unresolved = /\b(href|src)\s*=\s*"(?!data:|#|https?:|blob:)[^"]*\.(ico|png|jpe?g|gif|webp|avif|svg|woff2?|ttf|otf|mp3|ogg|wav|mp4|webm)"/i;
+  const leaked = unresolved.exec(doc.html);
+  const scriptsOk = doc.scripts.some(code => code.includes("__fixtureReady"))
+    && doc.scripts.some(code => code.includes("__inlineRan"));
+  const cssOk = /<style data-luna-source="style\.css">/.test(doc.html)
+    && /url\("data:font\/(?:ttf|otf|woff2?|sfnt)/.test(doc.html);
+
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+
+  const problems = [];
+  if (missing.length) problems.push(`not embedded: ${missing.join(",")}`);
+  if (leaked) problems.push(`relative ref survives: ${leaked[0].slice(0, 60)}`);
+  if (!scriptsOk) problems.push("scripts not collected");
+  if (!cssOk) problems.push("stylesheet/font urls not inlined");
+  if (doc.warnings.length) problems.push(`warnings: ${doc.warnings.slice(0, 3).join("; ")}`);
+  if (fontsMissing.length) problems.push(`no font source: ${fontsMissing.join(",")}`);
+
+  return {
+    ok: problems.length === 0,
+    detail: problems.length
+      ? problems.join(" | ")
+      : `${expected.length} binary types embedded, fonts=${expected.filter(n => n.startsWith("asset.woff") || n.endsWith(".ttf") || n.endsWith(".otf")).length}, scripts=2, no relative refs`
   };
 }
 
@@ -1619,6 +1865,8 @@ async function main() {
   uiChecks.push(["all-types", await verifyAllTypes(page, 43999)]);
   console.log("\nselftest: media extension matrix (isolated fixture library)");
   uiChecks.push(["extensions", await verifyExtensionMatrix(page, 43998)]);
+  console.log("\nselftest: every web resource type");
+  uiChecks.push(["web-assets", await verifyWebAssets(page)]);
   for (const [id, outcome] of uiChecks) {
     rows.push({ id, mode: "ui", load: "-", detail: outcome.detail, seconds: 0, ok: outcome.ok });
     console.log(`  ${outcome.ok ? "OK" : "FAIL"}  ${id}: ${outcome.detail}`);
